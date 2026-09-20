@@ -6,7 +6,9 @@ Usage: watch.py [--interval SECONDS] [--room NAME] [--dm SECRET]...
 Polls continuously and prints new messages from other nicks as they
 arrive — near-instant delivery with no server to run. Default interval
 is 10 seconds. Ctrl-C stops it. Read offset is tracked per room, shared
-with poll.py. Each --dm SECRET also watches that dead-drop room.
+with poll.py. Each --dm SECRET also watches that dead-drop room. EDIT
+lines from other nicks (edits.py) render with an (edited) marker — and
+are applied to the local message store when it knows the message.
 
 Why not long-polling? Upstash's REST API has no clean blocking-pop
 story, so a tight poll loop is the honest no-servers approach. For
@@ -23,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
     nick_conflict_holder, presence_beat, seen_path)
+import edits  # noqa: E402
+import store  # noqa: E402
 
 
 def read_seen(path):
@@ -59,7 +63,8 @@ def watch_once(targets):
                   file=sys.stderr)
         for m in msgs:
             if isinstance(m, str) and not m.startswith(NICK + ":"):
-                print(m, flush=True)
+                print(edits.render_incoming(m, store.room_for_key(key)),
+                      flush=True)
                 shown += 1
         seen += len(msgs)
         t[3] = seen

@@ -40,6 +40,11 @@ Idempotent: skips the send if the identical message is already at the tail.
               who guesses the secret (or can read the Redis) sees the
               messages.
 
+Every immediate send is recorded in the room's local message store
+(store.py) and prints its id as "MSG_ID <id>"; edit your own messages
+with edits.py <id> <new text>. Message bodies are capped at MAX_TEXT
+(relay_common) — use --blob for long content.
+
 Never prints the token.
 """
 import argparse
@@ -53,10 +58,11 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, api_get, blob_expire, blob_put, bus_get, bus_key, bus_push,
-    bus_trim, clean_room, dm_room, img_put, mod_add, mod_del, mute_add,
-    mute_del, nick_conflict_holder, presence_beat, recur_add, room_set_desc,
-    room_touch, typing_ping)
+    MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
+    bus_push, bus_trim, clean_room, dm_room, img_put, mod_add, mod_del,
+    mute_add, mute_del, nick_conflict_holder, presence_beat, recur_add,
+    room_set_desc, room_touch, typing_ping)
+import store  # noqa: E402
 
 TIMECAPSULE_KEY = "muse-bus:timecapsule"
 
@@ -171,8 +177,27 @@ def send_ephemeral(ttl_secs, key, text):
     return 0
 
 
+def _record_sent(key, text):
+    """Record a sent message in the room's local store (store.py).
+
+    Best-effort: the message is already on the bus, so a store failure
+    only costs the id. Returns the message id or None.
+    """
+    try:
+        st = store.open_store(store.room_for_key(key))
+        return st.append(NICK, text)["id"]
+    except Exception as e:
+        print(f"WARNING: store record failed ({e})", file=sys.stderr)
+        return None
+
+
 def post_message(text, key):
-    """Normal immediate send: idempotency guard, push, presence, trim."""
+    """Normal immediate send: length guard, idempotency guard, push,
+    store record, presence, trim."""
+    if len(text) > MAX_TEXT:
+        print(f"ERROR: message too long ({len(text)} chars; max "
+              f"{MAX_TEXT}) — use --blob for long content", file=sys.stderr)
+        return 2
     body = f"{NICK}: {text}"
     # Idempotency: never post the same body twice in a row.
     try:
@@ -188,6 +213,9 @@ def post_message(text, key):
     except Exception as e:
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
+    mid = _record_sent(key, text)
+    if mid:
+        print(f"MSG_ID {mid}")
     try:
         presence_beat(key)
     except Exception as e:

@@ -62,6 +62,11 @@ NICKS_KEY = "muse-bus:nicks"
 # Max messages kept per bus list. Override with MUSE_RELAY_KEEP.
 KEEP_MESSAGES = int(os.environ.get("MUSE_RELAY_KEEP", "500"))
 
+# Max chars for a chat message body, enforced by send.py and the EDIT
+# protocol (edits.py). Long content should ride --blob instead.
+# Override with MUSE_RELAY_MAX_TEXT.
+MAX_TEXT = int(os.environ.get("MUSE_RELAY_MAX_TEXT", "2000"))
+
 
 def _presence_key(nick):
     return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
