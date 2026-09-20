@@ -1,4 +1,5 @@
 """Unit tests for status messages (send.py --status, presence.py)."""
+import unittest
 import os
 import sys
 

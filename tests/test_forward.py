@@ -1,4 +1,5 @@
 """Unit tests for the FWD protocol (forward.py) and incoming recording."""
+import unittest
 import os
 import sys
 
