@@ -9,6 +9,8 @@ is 10 seconds. Ctrl-C stops it. Read offset is tracked per room, shared
 with poll.py. Each --dm SECRET also watches that dead-drop room. EDIT
 lines from other nicks (edits.py) render with an (edited) marker — and
 are applied to the local message store when it knows the message.
+Incoming messages from other nicks are recorded in the room's local
+message store, so they get ids usable with forward.py/saved.py.
 
 Why not long-polling? Upstash's REST API has no clean blocking-pop
 story, so a tight poll loop is the honest no-servers approach. For
@@ -61,11 +63,17 @@ def watch_once(targets):
         except Exception as e:
             print(f"WARNING: presence heartbeat failed ({e})",
                   file=sys.stderr)
+        try:
+            st = store.open_store(store.room_for_key(key))
+        except Exception:
+            st = None
         for m in msgs:
             if isinstance(m, str) and not m.startswith(NICK + ":"):
                 print(edits.render_incoming(m, store.room_for_key(key)),
                       flush=True)
                 shown += 1
+                if st is not None:
+                    edits.record_incoming(st, m, NICK)  # ids for FWD/SAVE
         seen += len(msgs)
         t[3] = seen
         write_seen(seen_file, seen)

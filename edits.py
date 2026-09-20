@@ -64,6 +64,33 @@ def apply_edit(st, msg_id, editor_nick, new_text, ts=None):
     return st.edit(msg_id, editor_nick, new_text, ts=ts)
 
 
+def record_incoming(st, line, my_nick):
+    """Record an incoming bus line in the room's store (best-effort).
+
+    poll.py and watch.py call this so locally-seen messages get store
+    ids — that's what makes FWD/SAVE-by-id work for other nicks'
+    messages, not just our own sends. Skips our own lines (send.py
+    already recorded them), EDIT protocol lines (they mutate existing
+    entries instead of being messages), and anything that isn't
+    "<nick>: <text>". Returns the stored entry, or None when skipped.
+    """
+    nick, sep, text = line.partition(": ")
+    if not sep or not nick or not text:
+        return None
+    if nick == my_nick:
+        return None
+    if parse_edit_text(text):
+        return None
+    try:
+        entries = st.entries()
+        if entries and entries[-1].get("text") == text \
+                and entries[-1].get("nick") == nick:
+            return None  # duplicate line (e.g. re-delivered); keep one id
+        return st.append(nick, text)
+    except Exception:
+        return None
+
+
 def render_incoming(line, room):
     """Render one incoming bus line for display, applying EDIT lines.
 

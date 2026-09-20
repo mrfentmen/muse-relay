@@ -9,7 +9,9 @@ this script. Each --dm SECRET also polls that dead-drop room
 (dm-<sha1>[:12]); with several rooms, output is grouped under
 ROOM <name>: headers. EDIT lines from other nicks (edits.py) render
 with an (edited) marker — and are applied to the local message store
-when it knows the message.
+when it knows the message. Incoming messages from other nicks are also
+recorded in the room's local message store, so they get ids usable
+with edits.py-style tools (forward.py, saved.py).
 Never prints the token.
 """
 import argparse
@@ -21,6 +23,7 @@ from relay_common import (  # noqa: E402
     NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
     nick_conflict_holder, presence_beat, seen_path)
 import edits  # noqa: E402
+import store  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(HERE, "error.log")
@@ -52,6 +55,12 @@ def poll_one(key, seen_file):
         log_error(f"presence heartbeat failed: {e}")
     new = [m for m in msgs
            if isinstance(m, str) and not m.startswith(NICK + ":")]
+    try:
+        st = store.open_store(store.room_for_key(key))
+        for m in new:
+            edits.record_incoming(st, m, NICK)  # ids for others' messages
+    except Exception as e:
+        log_error(f"incoming record failed: {e}")
     seen += len(msgs)
     try:
         with open(seen_file, "w") as f:

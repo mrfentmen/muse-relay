@@ -18,6 +18,7 @@ import edits  # noqa: E402
 import store  # noqa: E402
 import clipboard  # noqa: E402
 import paste  # noqa: E402
+import forward  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 
@@ -35,7 +36,7 @@ class RelayTestCase(unittest.TestCase):
         self.addCleanup(self._stop)
         # consumers did `from relay_common import api_get/...`: patch the
         # names in their namespaces too, not just relay_common's.
-        for mod in (jobs, send, poll, watch, edits, paste):
+        for mod in (jobs, send, poll, watch, edits, paste, forward):
             for name in ("api_get", "api_post", "bus_push"):
                 if hasattr(mod, name):
                     p = mock.patch.object(mod, name,
@@ -78,6 +79,7 @@ class RelayTestCase(unittest.TestCase):
         poll.NICK = nick
         watch.NICK = nick
         edits.NICK = nick
+        forward.NICK = nick
         rc._claim_state.update(checked=0.0, ok=None, holder=None)
 
     def run_cli(self, mod_main, argv, stdin=None):
