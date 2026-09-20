@@ -220,6 +220,57 @@
 </div>
 
 <script>
+/* QA FIXTURE — overrides fetch() with canned Upstash responses. No network. */
+(function () {
+  window.__captured = [];
+  function ok(v) {
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(v) });
+  }
+  function renderCap() {
+    let pre = document.getElementById("caplog");
+    if (!pre) {
+      pre = document.createElement("pre");
+      pre.id = "caplog";
+      pre.style.cssText = "background:#0d1117;border:1px solid #30363d;" +
+        "border-radius:6px;padding:8px;margin:12px;font-size:11px;" +
+        "white-space:pre-wrap;overflow-wrap:anywhere;color:#e6edf3;";
+      document.body.appendChild(pre);
+    }
+    pre.textContent = "CAPTURED WRITES:\n" +
+      window.__captured.map(c => JSON.stringify(c)).join("\n");
+  }
+  const GET = {
+    "/zrange/muse-bus:jobindex/0/-1": { result: ["7", "3"] },
+    "/hgetall/muse-bus:job:7": { result: ["title", "Bus viewer compose bar", "status", "open", "created_at", "1758300000", "created_by", "bob", "note", "needs UI"] },
+    "/hgetall/muse-bus:job:3": { result: ["title", "Rename UI", "status", "claimed", "claim", "alice", "created_at", "1758380000", "signed_by", "del"] },
+    "/get/muse-bus:job:7:spec": { result: "compose bar spec text" },
+    "/get/muse-bus:job:3:spec": { result: null },
+    "/smembers/muse-bus:nicks": { result: ["alice", "bob", "del", "mute"] },
+    "/hgetall/muse-bus:names": { result: ["alice", "{\"display\":\"Alice Cooper\",\"set_by\":\"del\",\"set_at\":1758380000}"] },
+    "/hget/muse-bus:names/alice": { result: "{\"display\":\"Alice Cooper\",\"set_by\":\"del\",\"set_at\":1758380000}" },
+    "/hget/muse-bus:names/bob": { result: null },
+    "/get/muse-bus:admin:secret_sha256": { result: "9a2db2e23f1504cd056606553ac049c5e718e8f9ce9233876df1a7a1821af885" },
+    "/smembers/muse-bus:admins": { result: ["del", "mute"] }
+  };
+  window.fetch = function (url, opts) {
+    const method = ((opts && opts.method) || "GET").toUpperCase();
+    const u = String(url);
+    let path = u.slice(u.indexOf("/", u.indexOf("//") + 2));
+    try { path = decodeURIComponent(path); } catch (e) { /* keep raw */ }
+    if (method === "POST") {
+      const body = (opts && opts.body) || "";
+      window.__captured.push({ path: path, body: String(body) });
+      renderCap();
+      return ok({ result: 1 });
+    }
+    for (const k of Object.keys(GET)) {
+      if (path === k || path.startsWith(k + "?")) return ok(GET[k]);
+    }
+    return ok({ result: null });
+  };
+})();
+</script>
+<script>
 "use strict";
 const $ = id => document.getElementById(id);
 const statusEl = $("status");

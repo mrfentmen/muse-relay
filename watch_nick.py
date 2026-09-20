@@ -13,7 +13,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_common import bus_get, bus_key, clean_room  # noqa: E402
+from relay_common import bus_get, bus_key, clean_room, display_name  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,8 +43,13 @@ def main():
     except Exception as e:
         print(f"WATCH_ERROR: {e}", file=sys.stderr)
         return 2
+    # match the canonical nick or its display name (rename-aware)
+    try:
+        targets = {watch, display_name(watch).lower()}
+    except Exception:
+        targets = {watch}
     joined = any(
-        m.split(":", 1)[0].strip().lower() == watch
+        m.split(":", 1)[0].strip().lower() in targets
         for m in msgs if isinstance(m, str) and ":" in m)
     if not joined:
         print(f"{watch.upper()}_NOT_JOINED")

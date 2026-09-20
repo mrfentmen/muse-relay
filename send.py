@@ -71,8 +71,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
-    bus_push, bus_trim, clean_room, clip_put, dm_room, img_put, mod_add,
-    mod_del, mute_add, mute_del, nick_claim, nick_conflict_holder,
+    bus_push, bus_trim, clean_room, clip_put, display_name, dm_room, img_put,
+    mod_add, mod_del, mute_add, mute_del, nick_claim, nick_conflict_holder,
     pomo_register, presence_beat,
     recur_add, room_set_desc, room_touch, status_set, typing_ping)
 import clipboard  # noqa: E402
@@ -285,7 +285,7 @@ def post_message(text, key):
         print(f"ERROR: message too long ({len(text)} chars; max "
               f"{MAX_TEXT}) — use --blob for long content", file=sys.stderr)
         return 2
-    body = f"{NICK}: {text}"
+    body = f"{display_name()}: {text}"
     # Idempotency: never post the same body twice in a row.
     try:
         tail = bus_get(-1, -1, key=key)

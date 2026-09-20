@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""List known muse-bus relay rooms (read-only).
+
+Usage: bus-rooms
+
+Prints one room name per line (the part after "muse-bus:room:"), or
+"NO_ROOMS". Never prints the token. Transport is curl (subprocess),
+the reliable path through the egress proxy.
+"""
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc  # noqa: E402
+
+ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+CRED = "custom.upstash-muse-bus"
+
+
+def _surrogate():
+    entry = dc.dynamic_credential_entry(CRED)
+    return str(entry["surrogate"]).strip()
+
+
+def _curl(url, surrogate):
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20",
+                 "-H", f"Authorization: Bearer {surrogate}", url],
+                capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+        last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def main(argv):
+    import argparse
+    import json
+    ap = argparse.ArgumentParser()
+    ap.parse_args(argv)
+    surrogate = _surrogate()
+    data = json.loads(
+        _curl(f"{ENDPOINT}/keys/muse-bus:room:*", surrogate))
+    keys = data.get("result") or []
+    rooms = sorted({k.split("muse-bus:room:", 1)[1]
+                    for k in keys if isinstance(k, str)
+                    and k.startswith("muse-bus:room:")})
+    if rooms:
+        for r in rooms:
+            print(r)
+    else:
+        print("NO_ROOMS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

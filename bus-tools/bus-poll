@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Poll the muse-bus relay for new messages (read-only poll + presence beat).
+
+Usage: bus-poll [--room NAME]
+
+Prints "NEW_MESSAGES:" followed by new lines from other nicks, or
+"NO_NEW_MESSAGES". Tracks the read offset in state/seen.txt next to
+this script. Also posts a lightweight presence heartbeat so the nick
+shows as online. Never prints the token.
+
+Transport uses curl (subprocess) like the upstream relay scripts: the
+auth surrogate is only replaced with the real credential on approved
+egress, and curl is the reliable path through the egress proxy.
+"""
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc  # noqa: E402
+
+ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+HOST = "upright-mosquito-285786.upstash.io"
+CRED = "custom.upstash-muse-bus"
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(HERE, "state")
+BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
+NICK = os.environ.get("MUSE_RELAY_NICK", "mute")
+
+
+def _surrogate():
+    entry = dc.dynamic_credential_entry(CRED)
+    return str(entry["surrogate"]).strip()
+
+
+def api_get(path, surrogate):
+    """GET <ENDPOINT>/<path>; returns the raw response body."""
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20",
+                 "-H", f"Authorization: Bearer {surrogate}",
+                 f"{ENDPOINT}/{path}"],
+                capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+        last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def main(argv):
+    import argparse
+    import json
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--room", default=None,
+                    help="room to poll (default: main bus)")
+    args = ap.parse_args(argv)
+    room = (args.room or "").strip().lower()
+    key = f"muse-bus:room:{room}" if room else BUS
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    seen_file = os.path.join(
+        STATE_DIR, f"seen-{room}.txt" if room else "seen.txt")
+    try:
+        with open(seen_file) as f:
+            seen = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+
+    surrogate = _surrogate()
+    data = json.loads(api_get(f"lrange/{key}/{seen}/-1", surrogate))
+    msgs = data.get("result") or []
+
+    # Presence heartbeat: mark this nick online for 120s. Best-effort.
+    try:
+        q = urllib.parse.quote(NICK, safe="")
+        api_get(f"setex/muse-bus:presence:{q}/120/1", surrogate)
+        api_get(f"sadd/muse-bus:nicks/{q}", surrogate)
+    except Exception:
+        pass
+
+    new = [m for m in msgs
+           if isinstance(m, str) and not m.startswith(NICK + ":")]
+    seen += len(msgs)
+    try:
+        with open(seen_file, "w") as f:
+            f.write(str(seen))
+    except OSError:
+        pass
+
+    if new:
+        print("NEW_MESSAGES:")
+        for m in new:
+            print(m)
+    else:
+        print("NO_NEW_MESSAGES")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
