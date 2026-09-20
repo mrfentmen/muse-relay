@@ -25,10 +25,16 @@ Signed jobs (defense against spoofed overseers):
   jobs.py claim <id> --secret-file ~/.config/muse-relay/job-secret
 
   The secret is a shared per-crew value distributed OUT OF BAND (your user
-  tells both sides; never post it to the bus). post stores an HMAC-SHA256
-  over the canonical job content; verify recomputes it; claim with
-  --secret-file refuses to claim a job whose signature is BAD. The secret
-  file is read as bytes (trailing whitespace stripped) and never printed.
+  tells both sides; never post it to the bus). The secret file is a keyring:
+  one "kid:secret" per line (chmod 600); the first key signs, all keys
+  verify, so keys rotate by adding a new kid line. A legacy single-token
+  file still works as kid "default". post stores an HMAC-SHA256 over the
+  canonical job content bound to the exact job id (v2 signatures); verify
+  recomputes it and reports OK/BAD/UNSIGNED/EXPIRED (exit 0 only on OK).
+  claim with --secret-file refuses BAD or EXPIRED jobs and posts a loud
+  REJECTED alert to the bus so spoof attempts are visible. --expires SECONDS
+  on post bounds how long a signature stays valid; --kid picks the signing
+  key. The secret file is never printed.
 
 Keys (MUSE_RELAY_JOBNS overrides the muse-bus:job prefix):
   <ns>seq            INCR job counter
@@ -51,6 +57,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sys
 import time
 import urllib.parse
@@ -127,22 +134,54 @@ def _valid_id(jid):
 # The secret is distributed OUT OF BAND — the user tells both sides
 # directly (a file both machines already have, a DM on another channel,
 # etc.). It must NEVER appear on the bus, in a spec, or in a commit.
-# The file holds the raw secret bytes; trailing whitespace is stripped.
+#
+# Keyring file format (chmod 600): one key per line as "kid:secret".
+# The FIRST line's key signs; every line's key verifies (so two kids can
+# be active during rotation). A legacy single-token file (no colon) still
+# works and is treated as kid "default". Secrets must not contain
+# whitespace, colons, or newlines.
+#
+# Signature versions: v1 is the original payload (title/spec/accept/
+# branch/base/room, single secret). v2 binds the signature to the exact
+# job instance (jid, kid, created_at, expires_at, nonce) so a captured
+# signature cannot be transplanted onto another job. New posts are v2;
+# v1 signatures still verify for jobs posted before the upgrade.
 
-def _read_secret(path):
-    """Read the shared crew secret. Returns (bytes, None) or (None, err)."""
+SIG_VERSION = "2"
+
+
+def _read_keyring(path):
+    """Read crew secret(s). Returns (dict {kid: bytes}, default_kid, None)
+    or (None, None, error string)."""
     try:
         with open(os.path.expanduser(path), "rb") as f:
-            secret = f.read().strip()
+            raw = f.read()
     except OSError as e:
-        return None, f"cannot read secret file {path!r}: {e}"
-    if not secret:
-        return None, f"secret file {path!r} is empty"
-    return secret, None
+        return None, None, f"cannot read secret file {path!r}: {e}"
+    lines = [ln.strip() for ln in raw.decode("utf-8", "replace").splitlines()
+             if ln.strip()]
+    if not lines:
+        return None, None, f"secret file {path!r} is empty"
+    keys = {}
+    if any(":" in ln for ln in lines):
+        for ln in lines:
+            if ln.count(":") != 1:
+                return None, None, \
+                    f"bad keyring line (want kid:secret): {ln!r}"
+            kid, sec = (p.strip() for p in ln.split(":"))
+            if not kid or not sec or any(c.isspace() for c in kid):
+                return None, None, f"bad keyring line: {ln!r}"
+            keys[kid] = sec.encode("utf-8")
+    else:
+        if len(lines) > 1:
+            return None, None, \
+                f"{path!r}: multiple secrets need kid:secret lines"
+        keys["default"] = lines[0].encode("utf-8")
+    return keys, next(iter(keys)), None
 
 
-def _canonical_payload(fields, spec):
-    """Deterministic bytes of exactly what the signature covers."""
+def _canonical_payload_v1(fields, spec):
+    """Original payload: what v1 signatures cover."""
     payload = {
         "title": fields.get("title", ""),
         "spec": spec,
@@ -155,14 +194,45 @@ def _canonical_payload(fields, spec):
                       separators=(",", ":")).encode("utf-8")
 
 
-def _sign_job(secret, fields, spec):
-    return hmac.new(secret, _canonical_payload(fields, spec),
+def _canonical_payload_v2(jid, kid, fields, spec):
+    """v2 payload: v1 fields plus the exact job instance identity.
+
+    Binding jid/kid/created_at/nonce means a signature lifted from one job
+    does not verify on any other job, even with identical content.
+    """
+    payload = {
+        "jid": str(jid),
+        "kid": str(kid),
+        "title": fields.get("title", ""),
+        "spec": spec,
+        "accept": fields.get("accept", ""),
+        "branch": fields.get("branch", ""),
+        "base": fields.get("base", ""),
+        "room": fields.get("room", ""),
+        # Redis stores hash values as strings; stringify here so the
+        # post-time computation matches the verify-time recomputation.
+        "created_at": str(fields.get("created_at", "")),
+        "expires_at": str(fields.get("expires_at", "")),
+        "nonce": str(fields.get("nonce", "")),
+    }
+    return json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _sign_job_v1(secret, fields, spec):
+    return hmac.new(secret, _canonical_payload_v1(fields, spec),
                     hashlib.sha256).hexdigest()
 
 
-def verify_job(jid, secret):
-    """Check a job's signature. Returns one of 'OK', 'BAD', 'UNSIGNED'.
+def _sign_job_v2(secret, jid, kid, fields, spec):
+    return hmac.new(secret, _canonical_payload_v2(jid, kid, fields, spec),
+                    hashlib.sha256).hexdigest()
 
+
+def verify_job(jid, keyring):
+    """Check a job's signature.
+
+    Returns one of 'OK', 'BAD', 'UNSIGNED', 'EXPIRED'.
     Raises ValueError for unknown job ids; other exceptions are transport
     failures from the state reads.
     """
@@ -172,7 +242,25 @@ def verify_job(jid, secret):
     sig = h.get("sig")
     if not sig:
         return "UNSIGNED"
-    good = hmac.compare_digest(_sign_job(secret, h, spec or ""), sig)
+    version = h.get("sig_v", "1")
+    if version == "1":
+        secret = keyring.get("default")
+        if secret is None:
+            return "BAD"
+        good = hmac.compare_digest(
+            _sign_job_v1(secret, h, spec or ""), sig)
+        return "OK" if good else "BAD"
+    if version != "2":
+        return "BAD"
+    kid = h.get("sig_kid", "")
+    secret = keyring.get(kid)
+    if secret is None:
+        return "BAD"  # signed with an unknown/retired key
+    exp = h.get("expires_at", "")
+    if exp and int(time.time()) > int(exp):
+        return "EXPIRED"
+    good = hmac.compare_digest(
+        _sign_job_v2(secret, jid, kid, h, spec or ""), sig)
     return "OK" if good else "BAD"
 
 
@@ -273,19 +361,39 @@ def cmd_post(args):
         print(f"RELAY_ERROR: post failed ({e})", file=sys.stderr)
         return 2
     if args.secret_file:
-        secret, serr = _read_secret(args.secret_file)
-        if serr:
-            print(f"ERROR: {serr}", file=sys.stderr)
+        keyring, default_kid, kerr = _read_keyring(args.secret_file)
+        if kerr:
+            print(f"ERROR: {kerr}", file=sys.stderr)
             return 2
+        kid = args.kid or default_kid
+        secret = keyring.get(kid)
+        if secret is None:
+            print(f"ERROR: unknown kid {kid!r} "
+                  f"(keyring has: {', '.join(sorted(keyring))})",
+                  file=sys.stderr)
+            return 2
+        if args.expires is not None and args.expires <= 0:
+            print("ERROR: --expires needs a positive number of seconds",
+                  file=sys.stderr)
+            return 2
+        nonce = secrets.token_hex(8)
+        expires_at = str(now + args.expires) if args.expires else ""
+        sig_fields = dict(fields)
+        sig_fields["nonce"] = nonce
+        sig_fields["expires_at"] = expires_at
         try:
             _hset(_job_key(jid), {
-                "sig": _sign_job(secret, fields, spec),
+                "sig": _sign_job_v2(secret, jid, kid, sig_fields, spec),
+                "sig_v": SIG_VERSION,
+                "sig_kid": kid,
                 "signed_by": NICK,
+                "nonce": nonce,
+                "expires_at": expires_at,
             })
         except Exception as e:
             print(f"RELAY_ERROR: signing failed ({e})", file=sys.stderr)
             return 2
-        print(f"SIGNED {jid}", file=sys.stderr)
+        print(f"SIGNED {jid} kid={kid}", file=sys.stderr)
     _announce(room, f"JOB:{jid} {args.title}")
     print(f"JOB {jid}")
     return 0
@@ -323,7 +431,8 @@ def cmd_show(args):
     for f in ("title", "status", "room", "branch", "base", "accept",
               "claim", "claim_host", "claimed_at", "lease_until",
               "result_commit", "note", "created_by", "created_host",
-              "created_at", "lease", "signed_by"):
+              "created_at", "lease", "signed_by", "sig_v", "sig_kid",
+              "expires_at", "nonce"):
         if h.get(f):
             print(f"{f}: {h[f]}")
     w = _creator_warning(h)
@@ -348,21 +457,31 @@ def cmd_claim(args):
         print(f"ERROR: no such job: {args.id}", file=sys.stderr)
         return 2
     if args.secret_file and h.get("sig"):
-        secret, serr = _read_secret(args.secret_file)
-        if serr:
-            print(f"ERROR: {serr}", file=sys.stderr)
+        keyring, _, kerr = _read_keyring(args.secret_file)
+        if kerr:
+            print(f"ERROR: {kerr}", file=sys.stderr)
             return 2
         try:
-            verdict = verify_job(args.id, secret)
+            verdict = verify_job(args.id, keyring)
         except Exception as e:
             print(f"RELAY_ERROR: verify failed ({e})", file=sys.stderr)
             return 2
-        if verdict == "BAD":
-            print(f"ERROR: job {args.id} signature BAD — spec or fields "
-                  f"were tampered with; not claiming", file=sys.stderr)
+        if verdict in ("BAD", "EXPIRED"):
+            # Loud refusal: a BAD/EXPIRED signature may be an active spoof
+            # attempt, so the whole crew sees it. Best-effort; never fails
+            # the refusal itself.
+            _announce(args.room or h.get("room") or "",
+                      f"REJECTED:{args.id} {verdict} "
+                      f"signed_by={h.get('signed_by', '?')} "
+                      f"rejected_by={NICK}")
+            print(f"ERROR: job {args.id} signature {verdict} — not claiming",
+                  file=sys.stderr)
             return 1
         # OK: fall through and claim. (Unsigned jobs have no sig to check;
         # the worker chose to verify, so an unsigned job is claimed as-is.)
+    elif args.secret_file:
+        print(f"WARNING: job {args.id} is unsigned — claiming without "
+              f"verification", file=sys.stderr)
     h = _claim_or_requeue(args.id, h)
     if h.get("status") != "open":
         print(f"ERROR: job {args.id} is {h.get('status')}"
@@ -409,12 +528,12 @@ def cmd_claim(args):
 
 
 def cmd_verify(args):
-    secret, serr = _read_secret(args.secret_file)
-    if serr:
-        print(f"ERROR: {serr}", file=sys.stderr)
+    keyring, _, kerr = _read_keyring(args.secret_file)
+    if kerr:
+        print(f"ERROR: {kerr}", file=sys.stderr)
         return 2
     try:
-        verdict = verify_job(args.id, secret)
+        verdict = verify_job(args.id, keyring)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -582,6 +701,10 @@ def main(argv=None):
     p.add_argument("--lease", type=int, default=LEASE_DEFAULT)
     p.add_argument("--secret-file", default="",
                    help="sign the job with this crew secret (HMAC-SHA256)")
+    p.add_argument("--kid", default="",
+                   help="key id to sign with (default: first key in the file)")
+    p.add_argument("--expires", type=int, default=None,
+                   help="signature validity in seconds from post time")
     p.set_defaults(fn=cmd_post)
 
     p = sub.add_parser("list", help="list jobs")

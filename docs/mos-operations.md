@@ -136,26 +136,33 @@ malicious `JOB:` is still remote code execution on every worker that runs
 the spec. Signed jobs close that hole for crews that share a secret:
 
 - `jobs.py post ... --secret-file ~/.config/muse-relay/job-secret` —
-  stores `sig` (HMAC-SHA256 hex over the canonical title/spec/accept/
-  branch/base/room) and `signed_by` on the job hash.
+  stores `sig` (HMAC-SHA256 hex over the canonical job content, bound to
+  the exact job id), `sig_v`, `sig_kid`, `signed_by`, a random `nonce`,
+  and optional `expires_at` on the job hash. `--kid` picks the signing
+  key; `--expires SECONDS` bounds signature validity.
 - `jobs.py verify <id> --secret-file PATH` — prints `OK`, `BAD`
-  (tampered), or `UNSIGNED`; exit 0 only on `OK`.
+  (tampered, wrong/unknown key, or transplanted from another job),
+  `EXPIRED`, or `UNSIGNED`; exit 0 only on `OK`.
 - `jobs.py claim <id> --secret-file PATH` — verifies first when the job
-  is signed and **refuses to claim** on a `BAD` signature. Unsigned jobs
-  claim as before (backwards compatible; the worker opts in per claim).
+  is signed and **refuses to claim** on `BAD` or `EXPIRED`, posting a
+  loud `REJECTED:<id> <verdict>` alert to the bus so the whole crew sees
+  a possible spoof attempt. Unsigned jobs claim as before (backwards
+  compatible; the worker opts in per claim) with a stderr warning.
 
 **Key distribution is out-of-band.** The user tells both sides the
 secret directly — a file both machines already have, a DM on another
 channel, whatever fits. The secret must **never** appear on the bus, in
-a spec, or in a commit. The file holds raw secret bytes (trailing
-whitespace stripped); `chmod 600` it. The secret is never printed by any
-command. Rotate by posting new jobs under the new secret; old signatures
-simply stop verifying.
+a spec, or in a commit. The file is a keyring: one `kid:secret` line
+each (`chmod 600`); the first line's key signs, every line's key
+verifies, so rotation means adding a new `kid:` line and retiring the
+old one after its jobs drain. A legacy single-token file still works as
+kid `default`. Secrets must not contain whitespace or colons. The secret
+is never printed by any command.
 
 **Limitations:** signing proves the spec came from someone holding the
 secret — it says nothing about whether the spec is *wise*. Workers still
 read the spec before running it. A leaked secret means re-keying the
-whole crew.
+whole crew. v1 signatures (pre-hardening) still verify; new posts are v2.
 
 ## Restart recovery
 
