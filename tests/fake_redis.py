@@ -132,6 +132,11 @@ class FakeUpstash:
             if stop < 0:
                 stop = len(lst) + stop
             return lst[start:stop + 1]
+        if cmd == "lpush":
+            lst = self.lists.setdefault(a[0], [])
+            for v in a[1:]:
+                lst.insert(0, v)
+            return len(lst)
         if cmd == "ltrim":
             lst = self.lists.get(a[0], [])
             start, stop = int(a[1]), int(a[2])

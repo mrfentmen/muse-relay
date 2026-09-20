@@ -63,6 +63,8 @@ python3 presence.py              # who's online right now
 python3 send.py --at 10m "standup in ten"   # scheduled delivery
 python3 send.py --ttl 5m "this burns soon"  # ephemeral message
 python3 send.py --blob ./notes.txt          # file attachment as BLOB: pointer
+python3 send.py --clip                      # push clipboard for paste.py on another machine
+python3 paste.py --stdout                   # pull your latest clip, raw bytes
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -168,6 +170,38 @@ cat log.txt | python3 send.py --blob -
 
 With `--ttl`, the chunks get an expiry too, so the whole paste burns.
 `relay_common.blob_get(hash)` reassembles the bytes.
+
+### Cross-machine clipboard
+
+`send.py --clip` pushes your local clipboard to the bus so the same nick
+on another machine can pull it — a shared clipboard with no servers:
+
+```bash
+python3 send.py --clip          # on machine A: copy my clipboard up
+python3 paste.py                # on machine B: pull it onto my clipboard
+python3 paste.py --stdout       # ...or dump the raw bytes to a pipe
+```
+
+The bytes ride the same chunked-blob transport as `--blob`; the pointer
+envelope (`hash`, size, pushing host, timestamp) is stored at
+`muse-bus:clip:<nick>` — **latest wins** — and a capped 20-entry history
+is kept at `muse-bus:clip:<nick>:log` for audit. Clips are keyed by nick,
+not by room, so there's no `--room`/`--dm` here: the point is moving
+bytes between *your* machines. Nothing is posted to any room's chat.
+
+Clipboard access uses whatever tool exists, in this order: `xclip`,
+`xsel`, `pbcopy`/`pbpaste` (macOS), `wl-copy`/`wl-paste` (Wayland),
+Termux, PowerShell. **Failure is loud, never a silent no-op**: no tool
+installed → both scripts exit 2 with the list they looked for and an
+install hint; a tool present but failing (usually "no display") → the
+error names every attempt. An empty clipboard is rejected too. If paste
+can't reach a clipboard, it says so and points at `--stdout` — it never
+dumps bytes to your terminal unasked.
+
+Integrity is checked on pull: the reassembled bytes must match the
+sha256 recorded in the envelope, or the paste fails with a clear error
+(corrupt or partially-expired blob). `paste.py` prints `NO_CLIP` when
+nothing has been pushed yet.
 
 ### DM dead-drops
 
@@ -454,6 +488,8 @@ python3 send.py --mute spammer
 | `jobs.py` | Crew job queue: post/claim/heartbeat/progress/done/blocked/requeue/sweep |
 | `store.py` | Local per-room JSONL message store (ids, edit history) |
 | `edits.py` | Edit your own messages: `edits.py <id> <new text>` |
+| `clipboard.py` | Local clipboard read/write with tool fallbacks (loud failures) |
+| `paste.py` | Pull your latest clip onto this machine's clipboard (`--stdout` for pipes) |
 | `bus.html` | Live web viewer (read-only, bring your own token) |
 | `jobs.py` | Redis-backed job queue for crew coordination (see below) |
 | `mos/` | Multi-agent orchestration layer (see below) |

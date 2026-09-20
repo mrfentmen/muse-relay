@@ -359,6 +359,72 @@ def blob_expire(h, n, seconds):
         api_get(f"expire/muse-bus:blob:{h}:{i}/{int(seconds)}")
 
 
+# --- Cross-machine clipboard --------------------------------------------#
+# The latest clip for a nick lives at muse-bus:clip:<nick> (latest wins);
+# muse-bus:clip:<nick>:log keeps the last CLIP_LOG_MAX envelopes newest-
+# first for audit. The envelope JSON points at the blob chunks that hold
+# the actual bytes (same transport as --blob).
+
+CLIP_LOG_MAX = 20
+
+
+def clip_key(nick=None):
+    """Redis key holding a nick's latest clip envelope."""
+    return "muse-bus:clip:" + urllib.parse.quote(nick or NICK, safe="")
+
+
+def clip_log_key(nick=None):
+    """Redis list key holding a nick's clip history (newest first)."""
+    return clip_key(nick) + ":log"
+
+
+def clip_put(h, n, size, name="clipboard", nick=None, host=None):
+    """Record a clip: latest-wins SET + capped LPUSH history.
+
+    The envelope {"hash","name","n","size","ts","host"} points at the
+    blob chunks (see blob_put). Returns the envelope string stored.
+    """
+    envelope = json.dumps({"hash": h, "name": name, "n": n, "size": size,
+                           "ts": int(time.time()),
+                           "host": host or INSTANCE_ID}, sort_keys=True)
+    q = urllib.parse.quote(envelope, safe="")
+    api_get(f"set/{clip_key(nick)}/{q}")
+    api_get(f"lpush/{clip_log_key(nick)}/{q}")
+    api_get(f"ltrim/{clip_log_key(nick)}/0/{CLIP_LOG_MAX - 1}")
+    return envelope
+
+
+def clip_latest(nick=None):
+    """Return the stored clip envelope dict for nick, or None.
+
+    Raises on transport failure; a corrupt/foreign envelope reads as
+    None rather than crashing the pull.
+    """
+    raw = json.loads(api_get(f"get/{clip_key(nick)}")).get("result")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        env = json.loads(raw)
+    except ValueError:
+        return None
+    return env if isinstance(env, dict) and env.get("hash") else None
+
+
+def clip_history(nick=None):
+    """Return the nick's clip envelopes, newest first (max CLIP_LOG_MAX)."""
+    data = json.loads(api_get(
+        f"lrange/{clip_log_key(nick)}/0/{CLIP_LOG_MAX - 1}"))
+    out = []
+    for raw in data.get("result") or []:
+        try:
+            env = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(env, dict) and env.get("hash"):
+            out.append(env)
+    return out
+
+
 RECUR_KEY = "muse-bus:recur"
 ROOMDIR_KEY = "muse-bus:roomdir"
 TYPING_TTL = 10  # seconds a typing indicator stays live

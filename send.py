@@ -2,9 +2,9 @@
 """Send a message to the muse-relay bus.
 
 Usage: send.py [--room NAME] [--dm SECRET] [--at SPEC] [--ttl SPEC]
-               [--blob PATH] [--img FILE] [--every DUR] [--typing]
-               [--mod-add NICK] [--mod-del NICK] [--mute NICK]
-               [--unmute NICK] [--desc TEXT] [--topic TEXT]
+               [--blob PATH] [--img FILE] [--clip] [--every DUR]
+               [--typing] [--mod-add NICK] [--mod-del NICK]
+               [--mute NICK] [--unmute NICK] [--desc TEXT] [--topic TEXT]
                ["message text"]
 Posts the plain string "<nick>: <message>" to the main bus, or to a room
 with --room. Rooms are separate lists; the default room is the legacy
@@ -23,6 +23,13 @@ Idempotent: skips the send if the identical message is already at the tail.
   --img FILE  like --blob but only for images (PNG/JPEG/GIF/WEBP, checked
               by magic bytes). Posts a BLOB: pointer. Combines with
               message text, not with --at/--ttl/--every/--blob.
+  --clip      push the local clipboard as a clip: the bytes ride the
+              same chunked-blob transport as --blob, and the pointer is
+              stored at muse-bus:clip:<nick> (latest wins, 20-entry
+              audit log). Posts nothing to any room; pull it on another
+              machine with paste.py. Fails loudly when no clipboard
+              tool exists (xclip/xsel/pbcopy/wl-paste/...) or when the
+              clipboard is empty. Not with other modes.
   --every DUR recurring message, durations only, minimum 60s. Posts
               nothing now; timecapsule.py delivers it every DUR and
               reschedules. Not with --at/--ttl/--blob/--img.
@@ -59,9 +66,10 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
-    bus_push, bus_trim, clean_room, dm_room, img_put, mod_add, mod_del,
-    mute_add, mute_del, nick_conflict_holder, presence_beat, recur_add,
-    room_set_desc, room_touch, typing_ping)
+    bus_push, bus_trim, clean_room, clip_put, dm_room, img_put, mod_add,
+    mod_del, mute_add, mute_del, nick_conflict_holder, presence_beat,
+    recur_add, room_set_desc, room_touch, typing_ping)
+import clipboard  # noqa: E402
 import store  # noqa: E402
 
 TIMECAPSULE_KEY = "muse-bus:timecapsule"
@@ -130,6 +138,34 @@ def read_blob_source(path):
         return sys.stdin.buffer.read()
     with open(path, "rb") as f:
         return f.read()
+
+
+def send_clip():
+    """Push the local clipboard as this nick's latest clip.
+
+    Bytes ride the --blob chunk transport; the pointer envelope goes to
+    muse-bus:clip:<nick> (latest wins) plus the capped audit log. Posts
+    nothing to any room — paste.py is the retrieval path. Returns the
+    process exit code.
+    """
+    try:
+        data = clipboard.clipboard_read()
+    except clipboard.ClipboardError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not data:
+        print("ERROR: clipboard is empty — nothing to clip",
+              file=sys.stderr)
+        return 2
+    try:
+        h, n = blob_put(data)
+        clip_put(h, n, len(data))
+    except Exception as e:
+        print(f"RELAY_ERROR: clip store failed ({e})", file=sys.stderr)
+        return 2
+    print(f"CLIP_STORED muse-bus:clip:{NICK} BLOB:{h}:clipboard:{n} "
+          f"({len(data)} bytes) — pull with paste.py")
+    return 0
 
 
 def schedule_message(when, key, text):
@@ -250,6 +286,10 @@ def main(argv=None):
     ap.add_argument("--img", default=None, metavar="FILE",
                     help="like --blob but images only (PNG/JPEG/GIF/WEBP, "
                          "magic-byte checked); posts a BLOB: pointer")
+    ap.add_argument("--clip", action="store_true",
+                    help="push the local clipboard as this nick's clip "
+                         "(muse-bus:clip:<nick>, latest wins); posts "
+                         "nothing to any room; pull with paste.py")
     ap.add_argument("--every", default=None, metavar="DUR",
                     help="recurring message, durations only, minimum 60s. "
                          "Posts nothing now; timecapsule.py delivers it "
@@ -278,6 +318,14 @@ def main(argv=None):
     if args.img and (args.at or args.ttl or args.every or args.blob):
         print("ERROR: --img doesn't combine with --at/--ttl/--every/--blob",
               file=sys.stderr)
+        return 2
+    if args.clip and (args.at or args.ttl or args.every or args.blob
+                      or args.img or args.mute or args.unmute
+                      or args.topic is not None or args.message
+                      or args.typing or args.desc is not None
+                      or args.mod_add or args.mod_del):
+        print("ERROR: --clip doesn't combine with other modes or message "
+              "text", file=sys.stderr)
         return 2
     if args.every and (args.at or args.ttl or args.blob or args.img):
         print("ERROR: --every doesn't combine with --at/--ttl/--blob/--img",
@@ -314,6 +362,12 @@ def main(argv=None):
                   file=sys.stderr)
 
     # One-shot ops that post nothing.
+    if args.clip:
+        rc_code = send_clip()
+        if rc_code == 0:
+            beat()
+        return rc_code
+
     if args.typing:
         try:
             typing_ping(key, NICK)

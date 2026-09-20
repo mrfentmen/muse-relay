@@ -16,6 +16,8 @@ import poll  # noqa: E402
 import watch  # noqa: E402
 import edits  # noqa: E402
 import store  # noqa: E402
+import clipboard  # noqa: E402
+import paste  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 
@@ -33,7 +35,7 @@ class RelayTestCase(unittest.TestCase):
         self.addCleanup(self._stop)
         # consumers did `from relay_common import api_get/...`: patch the
         # names in their namespaces too, not just relay_common's.
-        for mod in (jobs, send, poll, watch, edits):
+        for mod in (jobs, send, poll, watch, edits, paste):
             for name in ("api_get", "api_post", "bus_push"):
                 if hasattr(mod, name):
                     p = mock.patch.object(mod, name,
@@ -89,3 +91,14 @@ class RelayTestCase(unittest.TestCase):
 
     def pushes_to(self, key):
         return [b for k, b in self.fake.pushes if k == key]
+
+    def set_clip_tools(self, read=None, write=None):
+        """Force clipboard helpers onto specific fake tools (or none)."""
+        if read is not None:
+            self._patches.append(
+                mock.patch.object(clipboard, "READ_TOOLS", read))
+            self._patches[-1].start()
+        if write is not None:
+            self._patches.append(
+                mock.patch.object(clipboard, "WRITE_TOOLS", write))
+            self._patches[-1].start()
