@@ -193,9 +193,9 @@
       <button id="rn-go">rename</button>
       <button id="rn-cancel" class="ghost">cancel</button>
     </div>
-    <div class="fine">Signed with your admin secret (see Admin). The rename is
-    written to the relay's name registry + signed audit log, and takes effect
-    everywhere in the relay — message prefixes, presence, this board.</div>
+    <div class="fine">The rename is written to the relay's name registry +
+    audit log, and takes effect everywhere in the relay — message prefixes,
+    presence, this board.</div>
   </div>
 </div>
 <div id="adminModal" class="modal" hidden>
@@ -203,19 +203,13 @@
     <h3>admin setup</h3>
     <label for="ad-nick">your admin nick</label>
     <input id="ad-nick" type="text" autocomplete="off">
-    <label for="ad-secret">admin secret (hex)</label>
-    <input id="ad-secret" type="password" autocomplete="off">
     <div class="msg" id="ad-msg"></div>
     <div class="row">
-      <button id="ad-generate">generate new secret</button>
       <button id="ad-check" class="ghost">check</button>
       <button id="ad-close" class="ghost">close</button>
     </div>
-    <div class="fine" id="ad-gen"></div>
-    <div class="fine">The secret is kept in this browser's localStorage and
-    never leaves it except as HMAC signatures sent to your own Upstash.
-    To activate a newly generated secret: send its <b>sha256 hash</b> (shown
-    after generating) to Hana — never the secret itself.</div>
+    <div class="fine">Renames are admin-only: your nick must be in the relay's
+    admin set. No secret key — your Upstash token is the only credential.</div>
   </div>
 </div>
 
@@ -297,45 +291,16 @@ function pyStr(s) {
   }
   return out + '"';
 }
-function hexToBytes(hex) {
-  const b = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return b;
-}
-function bytesToHex(bytes) {
-  return [...new Uint8Array(bytes)]
-    .map(x => x.toString(16).padStart(2, '0')).join('');
-}
-async function sha256Hex(data) {
-  return bytesToHex(await crypto.subtle.digest('SHA-256', data));
-}
-async function hmacHex(secretHex, message) {
-  const key = await crypto.subtle.importKey('raw', hexToBytes(secretHex),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await crypto.subtle.sign('HMAC', key,
-    new TextEncoder().encode(message));
-  return bytesToHex(sig);
-}
 function randHexBytes(n) {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
-  return bytesToHex(b);
+  return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
 }
-/* canonical envelope for cmd=rename, keys in the sorted order admin.py uses */
-function canonicalRenameEnvelope(actor, nick, display, ts, nonce) {
-  return '{"actor":' + pyStr(actor)
-    + ',"args":{"display":' + pyStr(display) + ',"nick":' + pyStr(nick) + '}'
-    + ',"cmd":"rename"'
-    + ',"nonce":' + pyStr(nonce)
-    + ',"ts":' + ts
-    + ',"v":1}';
-}
-/* stored audit-log entry: admin.py's field order plus the signature */
-function renameLogEntry(actor, nick, display, ts, nonce, sig) {
+/* stored audit-log entry: admin.py's field order, keyless (sig null) */
+function renameLogEntry(actor, nick, display, ts, nonce) {
   return '{"v":1,"cmd":"rename","args":{"display":' + pyStr(display)
     + ',"nick":' + pyStr(nick) + '},"actor":' + pyStr(actor)
-    + ',"ts":' + ts + ',"nonce":' + pyStr(nonce)
-    + ',"sig":' + pyStr(sig) + '}';
+    + ',"ts":' + ts + ',"nonce":' + pyStr(nonce) + ',"sig":null}';
 }
 function namesHashEntry(actor, display, ts) {
   return '{"display":' + pyStr(display) + ',"set_by":' + pyStr(actor)
@@ -559,15 +524,8 @@ function adminNick() {
   try { return (localStorage.getItem("crew-admin-nick") || "del").trim() || "del"; }
   catch (e) { return "del"; }
 }
-function adminSecretHex() {
-  try { return (localStorage.getItem("crew-admin-secret") || "").trim(); }
-  catch (e) { return ""; }
-}
 function saveAdminNick(n) {
   try { localStorage.setItem("crew-admin-nick", n); } catch (e) {}
-}
-function saveAdminSecret(h) {
-  try { localStorage.setItem("crew-admin-secret", h); } catch (e) {}
 }
 
 async function refreshPeople() {
@@ -612,9 +570,6 @@ async function openRename(nick) {
   } catch (e) {
     $("rn-current").textContent = "(couldn't load)";
   }
-  if (!adminSecretHex()) {
-    setRnMsg("No admin secret set — open Admin to set it up first.", "err");
-  }
   setTimeout(() => $("rn-display").focus(), 50);
 }
 
@@ -627,38 +582,26 @@ async function submitRename() {
   const nick = renameTarget;
   const display = $("rn-display").value.trim();
   const actor = ($("rn-actor").value.trim() || adminNick());
-  const secretHex = adminSecretHex();
   saveAdminNick(actor);
   if (!nick) return;
   if (!display) { setRnMsg("Display name is empty.", "err"); return; }
   if (display.length > 32) { setRnMsg("Display name too long (max 32 chars).", "err"); return; }
   if (/[:\n\r]/.test(display)) { setRnMsg("Display name may not contain ':' or newlines.", "err"); return; }
-  if (!secretHex || !/^[0-9a-fA-F]{64}$/.test(secretHex)) {
-    setRnMsg("No valid admin secret set — open Admin to set it up.", "err"); return;
-  }
-  if (!crypto.subtle) { setRnMsg("This browser can't do the signing (needs a secure context).", "err"); return; }
   try {
     setRnMsg("checking admin…", "");
-    const h = await api("/get/" + ADMIN_PREFIX + ":admin:secret_sha256");
-    const calc = await sha256Hex(hexToBytes(secretHex));
-    if (!h.result || h.result !== calc) {
-      throw new Error("admin secret does not match — check Admin setup");
-    }
     const a = await api("/smembers/" + ADMIN_PREFIX + ":admins");
     if (!((a.result || []).includes(actor))) {
       throw new Error("nick '" + actor + "' is not an admin");
     }
-    setRnMsg("signing + writing…", "");
+    setRnMsg("writing…", "");
     const ts = Math.floor(Date.now() / 1000);
     const nonce = randHexBytes(8);
-    const sig = await hmacHex(secretHex,
-      canonicalRenameEnvelope(actor, nick, display, ts, nonce));
     await apiPost("/hset/" + ADMIN_PREFIX + ":names/" + qNick(nick),
       namesHashEntry(actor, display, ts));
     await apiPost("/rpush/" + ADMIN_PREFIX + ":names:history",
       namesHistoryEntry(actor, nick, display, ts));
     await apiPost("/rpush/" + ADMIN_PREFIX + ":admin:log",
-      renameLogEntry(actor, nick, display, ts, nonce, sig));
+      renameLogEntry(actor, nick, display, ts, nonce));
     setRnMsg("Renamed '" + nick + "' → '" + display + "'.", "ok");
     await refreshPeople();
   } catch (e) {
@@ -675,51 +618,26 @@ function setAdMsg(text, kind) {
 
 function openAdmin() {
   $("ad-nick").value = adminNick();
-  $("ad-secret").value = adminSecretHex();
   setAdMsg("", "");
-  $("ad-gen").innerHTML = "";
   $("adminModal").hidden = false;
 }
 
 function closeAdmin() {
   saveAdminNick($("ad-nick").value.trim() || "del");
-  saveAdminSecret($("ad-secret").value.trim());
   $("adminModal").hidden = true;
-}
-
-async function generateSecret() {
-  const hex = randHexBytes(32);
-  $("ad-secret").value = hex;
-  saveAdminSecret(hex);
-  const hash = await sha256Hex(hexToBytes(hex));
-  $("ad-gen").innerHTML =
-    `new secret generated and saved in this browser.<br>` +
-    `sha256: <code>${esc(hash)}</code><br>` +
-    `Send <b>only this hash</b> to Hana (in chat) to activate it — ` +
-    `never the secret itself.`;
-  setAdMsg("Secret generated. It is NOT active until Hana activates the hash.", "");
 }
 
 async function checkAdmin() {
   const nick = $("ad-nick").value.trim() || "del";
-  const hex = $("ad-secret").value.trim();
   saveAdminNick(nick);
-  saveAdminSecret(hex);
-  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
-    setAdMsg("Secret must be 64 hex chars (32 bytes).", "err"); return;
-  }
   try {
     setAdMsg("checking…", "");
-    const h = await api("/get/" + ADMIN_PREFIX + ":admin:secret_sha256");
-    const calc = await sha256Hex(hexToBytes(hex));
-    if (!h.result) { setAdMsg("No admin registry on this bus yet.", "err"); return; }
-    if (h.result !== calc) { setAdMsg("Secret does NOT match the registry.", "err"); return; }
     const a = await api("/smembers/" + ADMIN_PREFIX + ":admins");
     const admins = a.result || [];
     if (admins.includes(nick)) {
-      setAdMsg("OK — secret matches and '" + nick + "' is an admin.", "ok");
+      setAdMsg("OK — '" + nick + "' is an admin.", "ok");
     } else {
-      setAdMsg("Secret matches, but '" + nick + "' is not an admin " +
+      setAdMsg("'" + nick + "' is not an admin " +
         "(admins: " + admins.join(", ") + ").", "err");
     }
   } catch (e) {
@@ -782,7 +700,6 @@ document.addEventListener("click", ev => {
 });
 $("adminBtn").addEventListener("click", openAdmin);
 $("ad-close").addEventListener("click", closeAdmin);
-$("ad-generate").addEventListener("click", generateSecret);
 $("ad-check").addEventListener("click", checkAdmin);
 $("rn-go").addEventListener("click", submitRename);
 $("rn-cancel").addEventListener("click", closeRename);

@@ -67,8 +67,8 @@ def _read_secret(path):
     try:
         with open(os.path.expanduser(path), "rb") as f:
             secret = f.read().strip()
-    except OSError as e:
-        return None, f"cannot read secret file {path!r}: {e}"
+    except OSError:
+        return None, None  # no secret file -> keyless mode
     if not secret:
         return None, f"secret file {path!r} is empty"
     return secret, None
@@ -105,14 +105,16 @@ def _make_envelope(secret, cmd, args):
         "ts": int(time.time()),
         "nonce": secrets.token_hex(8),
     }
-    env["sig"] = _sign(secret, env)
+    env["sig"] = _sign(secret, env) if secret else None
     return env
 
 
 def _verify_envelope(secret, env):
-    sig = env.get("sig", "")
+    sig = env.get("sig")
     if not sig:
-        return False
+        return None  # keyless entry: no signature to check
+    if secret is None:
+        return False  # signed entry but no key available to verify
     return hmac.compare_digest(_sign(secret, env), sig)
 
 
@@ -122,19 +124,21 @@ def _log_envelope(env):
 
 
 def _require_admin(secret):
-    """Returns (True, None) when the secret is right and rc.NICK is an admin.
+    """Returns (True, None) when authorized and rc.NICK is an admin.
 
-    Checks the secret against the stored sha256 first, so a wrong secret
-    fails closed instead of writing a bad-signature entry to the log.
+    When a secret marker is registered, the secret must match it (fails
+    closed). When no marker exists the registry is keyless: only the
+    admin-set membership is checked.
     """
     try:
         data = json.loads(rc.api_get(f"get/{_k('admin', 'secret_sha256')}"))
         stored = data.get("result")
     except Exception:
         stored = None
-    if not stored or not hmac.compare_digest(
-            hashlib.sha256(secret).hexdigest(), stored):
-        return False, "admin secret does not match the initialized secret"
+    if stored:
+        if secret is None or not hmac.compare_digest(
+                hashlib.sha256(secret).hexdigest(), stored):
+            return False, "admin secret does not match the initialized secret"
     if rc.NICK not in _admins():
         return False, (f"nick '{rc.NICK}' is not an admin "
                        f"(admins: {', '.join(sorted(_admins())) or 'none'})")
@@ -161,11 +165,13 @@ def cmd_init(args):
     if err:
         print(f"ERROR: {err}")
         return 1
-    digest = hashlib.sha256(secret).hexdigest()
-    rc.api_get(f"set/{_k('admin', 'secret_sha256')}/{digest}")
+    if secret:
+        digest = hashlib.sha256(secret).hexdigest()
+        rc.api_get(f"set/{_k('admin', 'secret_sha256')}/{digest}")
     rc.api_get(f"sadd/{_k('admins')}/{_q(rc.NICK)}")
     _log_envelope(_make_envelope(secret, "init", {}))
-    print(f"OK admin initialized; '{rc.NICK}' is the founding admin")
+    mode = "signed" if secret else "keyless"
+    print(f"OK admin initialized ({mode}); '{rc.NICK}' is the founding admin")
     return 0
 
 
@@ -340,16 +346,20 @@ def cmd_verify(args):
                   if e.get("cmd") == "rekey"], default=-1)
     sealed = entries[:marker + 1]
     live = entries[marker + 1:]
-    bad = [i for i, e in enumerate(live, start=marker + 1)
-           if not _verify_envelope(secret, e)]
+    results = [_verify_envelope(secret, e)
+               for e in live]
+    bad = [i for i, r in enumerate(results, start=marker + 1) if r is False]
+    keyless = [i for i, r in enumerate(results, start=marker + 1) if r is None]
     if bad:
         print(f"VERIFY FAIL: {len(bad)} of {len(live)} post-rekey log "
               f"entries have BAD signatures (indexes {bad})")
         return 1
     sealed_note = (f" ({len(sealed)} sealed under a previous secret)"
                    if sealed else "")
+    keyless_note = (f" ({len(keyless)} keyless entries, no signature)"
+                    if keyless else "")
     print(f"VERIFY OK: {len(live)} entries checked, all signatures "
-          f"valid{sealed_note}")
+          f"valid{sealed_note}{keyless_note}")
     return 0
 
 
