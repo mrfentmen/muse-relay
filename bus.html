@@ -2527,6 +2527,301 @@ try {
   };
 })();
 
+// ---- FEATURE: tap-to-rename ----
+// Every nick in the chat log becomes a tappable button. Tapping opens a
+// rename sheet; the rename is a keyless admin write (actor nick must be in
+// muse-bus:admins — the Upstash token is the only credential). The chat
+// shows display names from the name registry and refreshes them live.
+// Self-contained IIFE: uses window.busHooks + window.busUtil only.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.message || !H.message.push ||
+      typeof document === "undefined") return;
+
+  var ADMIN_PREFIX = "muse-bus";
+  var nameCache = {};    // raw nick -> display name
+  var renameTarget = null;
+
+  /*__SIGNING_START__*/
+  /* Pure entry builders — no DOM. Renames are keyless:
+     the chat writes the name registry entry, history entry, and
+     audit-log entry (sig null) directly. The Upstash token is the
+     only credential. (Byte-identical to crew-board.html's block;
+     interop-tested against admin.py in tests/test_bus_rename.py.) */
+  function pyStr(s) {
+    let out = '"';
+    for (const ch of String(s)) {
+      const c = ch.codePointAt(0);
+      if (ch === '"') out += '\\"';
+      else if (ch === '\\') out += '\\\\';
+      else if (c === 8) out += '\\b';
+      else if (c === 12) out += '\\f';
+      else if (c === 10) out += '\\n';
+      else if (c === 13) out += '\\r';
+      else if (c === 9) out += '\\t';
+      else if (c < 0x20 || c > 0x7e) {
+        if (c > 0xffff) {
+          const v = c - 0x10000;
+          out += '\\u' + (0xd800 + (v >> 10)).toString(16).padStart(4, '0')
+               + '\\u' + (0xdc00 + (v & 0x3ff)).toString(16).padStart(4, '0');
+        } else {
+          out += '\\u' + c.toString(16).padStart(4, '0');
+        }
+      } else out += ch;
+    }
+    return out + '"';
+  }
+  function randHexBytes(n) {
+    const b = new Uint8Array(n);
+    crypto.getRandomValues(b);
+    return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+  }
+  function qNick(n) {
+    return encodeURIComponent(n).replace(/[!'()*]/g,
+      c => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  }
+  /* stored audit-log entry: admin.py's field order, keyless (sig null) */
+  function renameLogEntry(actor, nick, display, ts, nonce) {
+    return '{"v":1,"cmd":"rename","args":{"display":' + pyStr(display)
+      + ',"nick":' + pyStr(nick) + '},"actor":' + pyStr(actor)
+      + ',"ts":' + ts + ',"nonce":' + pyStr(nonce) + ',"sig":null}';
+  }
+  function namesHashEntry(actor, display, ts) {
+    return '{"display":' + pyStr(display) + ',"set_by":' + pyStr(actor)
+      + ',"set_at":' + ts + '}';
+  }
+  function namesHistoryEntry(actor, nick, display, ts) {
+    return '{"nick":' + pyStr(nick) + ',"display":' + pyStr(display)
+      + ',"set_by":' + pyStr(actor) + ',"set_at":' + ts + '}';
+  }
+  /* Parse an hgetall result (object or flat [k,v,...] array) into
+     {nick: display}; junk values are dropped. */
+  function parseNames(raw) {
+    var out = {};
+    function displayOf(v) {
+      try {
+        var o = JSON.parse(v);
+        return (o && o.display) ? String(o.display) : null;
+      } catch (e) { return null; }
+    }
+    if (Array.isArray(raw)) {
+      for (var i = 0; i + 1 < raw.length; i += 2) {
+        var d = displayOf(raw[i + 1]);
+        if (d) out[raw[i]] = d;
+      }
+    } else if (raw && typeof raw === "object") {
+      Object.keys(raw).forEach(function (k) {
+        var d = displayOf(raw[k]);
+        if (d) out[k] = d;
+      });
+    }
+    return out;
+  }
+  /* Label to show for a nick given the name cache. */
+  function labelFor(cache, nick) {
+    return (cache && cache[nick]) || nick;
+  }
+  /*__SIGNING_END__*/
+
+  function el(id) { return U.el(id); }
+
+  async function post(path, body) {
+    var url = el("url").value.replace(/\/+$/, "");
+    var res = await fetch(url + path, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + el("token").value,
+        "Content-Type": "application/json"
+      },
+      body: body
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+
+  function logEl() { return document.getElementById("log"); }
+
+  /* Turn every not-yet-wired .nick span in the log into a tappable
+     button showing the current display name. */
+  function wireNicks() {
+    var log = logEl();
+    if (!log) return;
+    var divs = log.querySelectorAll(".msg");
+    for (var i = 0; i < divs.length; i++) {
+      var div = divs[i];
+      if (div.getAttribute("data-rnwired")) continue;
+      div.setAttribute("data-rnwired", "1");
+      var sp = div.querySelector(".nick");
+      if (!sp) continue;
+      var nick = sp.textContent.replace(/^\s+|\s+$/g, "");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "nickbtn";
+      btn.style.color = sp.style.color || "";
+      btn.setAttribute("data-nick", nick);
+      btn.textContent = labelFor(nameCache, nick);
+      btn.title = "tap to rename " + nick;
+      btn.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        openBusRename(this.getAttribute("data-nick"));
+      });
+      sp.parentNode.replaceChild(btn, sp);
+    }
+  }
+
+  /* Re-apply display names to visible nick buttons (after a rename). */
+  function applyNames() {
+    var log = logEl();
+    if (!log) return;
+    var btns = log.querySelectorAll(".nickbtn");
+    for (var i = 0; i < btns.length; i++) {
+      var nick = btns[i].getAttribute("data-nick");
+      btns[i].textContent = labelFor(nameCache, nick);
+      btns[i].title = "tap to rename " + nick;
+    }
+  }
+
+  async function loadNames() {
+    try {
+      var r = await U.api("/hgetall/" + ADMIN_PREFIX + ":names");
+      nameCache = parseNames(r && r.result);
+      applyNames();
+    } catch (e) { /* names are best-effort; the log matters more */ }
+  }
+
+  function injectCss() {
+    if (document.getElementById("bus-rename-css")) return;
+    var st = document.createElement("style");
+    st.id = "bus-rename-css";
+    st.textContent =
+      ".nickbtn{background:none;border:0;padding:0;font:inherit;font-weight:700;" +
+      "cursor:pointer;color:inherit;text-align:left;margin-right:8px}" +
+      ".nickbtn:hover{text-decoration:underline}" +
+      "#busRenameModal{position:fixed;inset:0;background:rgba(0,0,0,.62);" +
+      "display:flex;align-items:center;justify-content:center;z-index:200}" +
+      "#busRenameModal[hidden]{display:none}" +
+      ".bus-rn-sheet{background:#161b22;border:1px solid #30363d;border-radius:12px;" +
+      "padding:18px;width:min(92vw,380px);color:#c9d1d9}" +
+      ".bus-rn-sheet h3{margin:0 0 10px;font-size:16px}" +
+      ".bus-rn-row{margin:6px 0;color:#8b949e;font-size:13px}" +
+      ".bus-rn-sheet label{display:block;margin:10px 0;font-size:13px;color:#8b949e}" +
+      ".bus-rn-sheet input{width:100%;margin-top:6px;padding:9px 10px;background:#0d1117;" +
+      "border:1px solid #30363d;border-radius:8px;color:#c9d1d9;font-size:15px;box-sizing:border-box}" +
+      ".bus-rn-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}" +
+      ".bus-rn-actions button{padding:9px 16px;border-radius:8px;border:1px solid #30363d;" +
+      "background:#21262d;color:#c9d1d9;font-size:14px;cursor:pointer}" +
+      "#bus-rn-go{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:700}" +
+      "#bus-rn-msg{margin-top:10px;min-height:18px;font-size:13px}" +
+      "#bus-rn-msg.err{color:#f85149}" +
+      "#bus-rn-msg.ok{color:#3fb950}" +
+      ".bus-rn-fine{margin-top:10px;font-size:12px;color:#6e7681}";
+    document.head.appendChild(st);
+  }
+
+  function injectModal() {
+    if (document.getElementById("busRenameModal")) return;
+    var wrap = document.createElement("div");
+    wrap.id = "busRenameModal";
+    wrap.hidden = true;
+    wrap.innerHTML =
+      '<div class="bus-rn-sheet" role="dialog" aria-label="rename person">' +
+      '<h3>rename <span id="bus-rn-nick"></span></h3>' +
+      '<div class="bus-rn-row">current: <span id="bus-rn-current"></span></div>' +
+      '<label>new display name' +
+      '<input id="bus-rn-display" maxlength="32" autocomplete="off" ' +
+      'placeholder="Display name"></label>' +
+      '<div class="bus-rn-actions">' +
+      '<button type="button" id="bus-rn-cancel">cancel</button>' +
+      '<button type="button" id="bus-rn-go">rename</button>' +
+      '</div>' +
+      '<div id="bus-rn-msg"></div>' +
+      '<div class="bus-rn-fine">Renames are admin-only: your nick (the "nick" ' +
+      'field up top) must be in the relay\'s admin set. No key needed.</div>' +
+      '</div>';
+    document.body.appendChild(wrap);
+    el("bus-rn-cancel").addEventListener("click", closeBusRename);
+    el("bus-rn-go").addEventListener("click", submitBusRename);
+    el("bus-rn-display").addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") submitBusRename();
+    });
+    wrap.addEventListener("click", function (ev) {
+      if (ev.target === wrap) closeBusRename();
+    });
+  }
+
+  function setMsg(text, kind) {
+    var m = el("bus-rn-msg");
+    m.textContent = text;
+    m.className = kind || "";
+  }
+
+  function openBusRename(nick) {
+    renameTarget = nick;
+    var cur = nameCache[nick] || "";
+    el("bus-rn-nick").textContent = nick;
+    el("bus-rn-current").textContent =
+      cur ? cur : "(none — shows as " + nick + ")";
+    el("bus-rn-display").value = cur;
+    setMsg("", "");
+    el("busRenameModal").hidden = false;
+    setTimeout(function () { el("bus-rn-display").focus(); }, 50);
+  }
+
+  function closeBusRename() {
+    el("busRenameModal").hidden = true;
+    renameTarget = null;
+  }
+
+  async function submitBusRename() {
+    var nick = renameTarget;
+    var display = el("bus-rn-display").value.replace(/^\s+|\s+$/g, "");
+    var actor = U.myNick();
+    if (!nick) return;
+    if (!display) { setMsg("Display name is empty.", "err"); return; }
+    if (display.length > 32) {
+      setMsg("Display name too long (max 32 chars).", "err"); return;
+    }
+    if (/[:\n\r]/.test(display)) {
+      setMsg("Display name may not contain ':' or newlines.", "err"); return;
+    }
+    try {
+      setMsg("checking admin…", "");
+      var a = await U.api("/smembers/" + ADMIN_PREFIX + ":admins");
+      if ((a.result || []).indexOf(actor) === -1) {
+        throw new Error("nick '" + actor + "' is not an admin");
+      }
+      setMsg("writing…", "");
+      var ts = Math.floor(Date.now() / 1000);
+      var nonce = randHexBytes(8);
+      await post("/hset/" + ADMIN_PREFIX + ":names/" + qNick(nick),
+        namesHashEntry(actor, display, ts));
+      await post("/rpush/" + ADMIN_PREFIX + ":names:history",
+        namesHistoryEntry(actor, nick, display, ts));
+      await post("/rpush/" + ADMIN_PREFIX + ":admin:log",
+        renameLogEntry(actor, nick, display, ts, nonce));
+      setMsg("Renamed '" + nick + "' → '" + display + "'.", "ok");
+      await loadNames();
+    } catch (e) {
+      setMsg("rename failed: " + e.message, "err");
+    }
+  }
+
+  try { injectCss(); injectModal(); } catch (e) { /* never break the log */ }
+
+  H.connect.push(function () { loadNames(); wireNicks(); });
+  H.poll.push(function () { wireNicks(); });
+  setInterval(function () { loadNames(); }, 60000);
+
+  window.__busTest = window.__busTest || {};
+  window.__busTest.busRename = {
+    open: openBusRename, close: closeBusRename, submit: submitBusRename,
+    wireNicks: wireNicks, applyNames: applyNames, loadNames: loadNames,
+    _cache: function (c) { if (c) nameCache = c; return nameCache; }
+  };
+})();
+
+
 // ================== END FEATURES ==================
 </script>
 </body>
