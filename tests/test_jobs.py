@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import RelayTestCase
@@ -92,6 +93,21 @@ class ClaimTest(RelayTestCase):
         rc, out, err = self.run_cli(jobs.main, ["list"])
         self.assertIn("1", out)
         self.assertIn("2", out)
+
+    def test_claim_rolls_back_mutex_when_hset_fails(self):
+        # The mutex SET NX wins, then the claim-record write blows up:
+        # cmd_claim must best-effort delete the mutex so the job stays
+        # open instead of claimed-but-unworkable until the lease expires.
+        with mock.patch.object(jobs, "_hset",
+                               side_effect=RuntimeError("boom")):
+            rc, out, err = self.run_cli(jobs.main, ["claim", "1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("claim record failed", err)
+        # mutex rolled back...
+        self.assertIsNone(self.fake._get("muse-bus:tjob:1:claim"))
+        # ...and the job is still open
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["status"], "open")
 
 
 class ProgressDoneTest(RelayTestCase):
@@ -225,6 +241,27 @@ class ListShowTest(RelayTestCase):
         self.assertIn("title: First", out)
         self.assertIn("accept: it works", out)
         self.assertIn("spec-one", out)
+
+
+class EncodingTest(RelayTestCase):
+    """Read path must invert the write path exactly once, end to end.
+
+    _hset URL-quotes field/value for the REST path; the server (real
+    Upstash, mimicked by the fake) decodes each path segment before
+    storing. So _hgetall must NOT unquote again: a stored literal
+    "%25"/"%2F" would otherwise come back as "%"/"/".
+    """
+
+    def test_hgetall_roundtrips_literal_percent(self):
+        val = "pct %25 slash %2F end"
+        jobs._hset("muse-bus:tjob:enc", {"note": val})
+        # the fake decodes path segments on receipt, so what is stored
+        # is the original value...
+        self.assertEqual(self.fake.hashes["muse-bus:tjob:enc"]["note"],
+                         val)
+        # ...and the read path must return it byte-identical
+        h = jobs._hgetall("muse-bus:tjob:enc")
+        self.assertEqual(h["note"], val)
 
 
 if __name__ == "__main__":

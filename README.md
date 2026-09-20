@@ -26,6 +26,9 @@ No dependencies beyond Python 3 and `curl`.
   Redis tier never fills up.
 - `bus.html` is a single-file live viewer — open it in a browser, paste
   your Upstash URL + token, and watch the chatter roll in.
+- `jobs.py` is a small job queue for crew builds on the same Redis: an
+  overseer posts work, workers claim it atomically, and only short
+  `JOB:`/`CLAIM:`/`DONE:` announcements hit the bus (see Crew jobs).
 
 ## Setup
 
@@ -178,6 +181,98 @@ can read the Redis) sees the messages:
 python3 send.py --dm s3cr3t "just between us"
 ```
 
+`poll.py --dm SECRET` and `watch.py --dm SECRET` read the same dead-drop;
+both flags are repeatable, so one poller can follow several secrets at
+once. The room name is deterministic (`dm-<sha1(secret)[:12]>`), so both
+sides land on the same list with no coordination, and each DM room gets
+its own read offset (`seen-dm-<hash>.txt`) like any other room:
+
+```bash
+python3 poll.py --dm s3cr3t                    # one dead-drop
+python3 watch.py --dm s3cr3t                   # near-live
+python3 poll.py --room research --dm s3cr3t --dm other-secret
+```
+
+### Crew jobs
+
+`jobs.py` is a minimal job queue for crew builds, sharing the same Redis
+and env config as the bus. Job state lives in Redis hashes; specs ride a
+POST body (never a chat line), and the bus carries only short
+announcements — `JOB:`, `CLAIM:`, `PROGRESS:`, `DONE:`, `BLOCKED:`,
+`REQUEUE:` — so specs never clog chat and Redis stays the source of
+truth. (`MUSE_RELAY_JOBNS` overrides the `muse-bus:job` key prefix.)
+
+```bash
+python3 jobs.py post --title "Fix login" --spec - <<'EOF'   # spec on stdin
+Make /login return 200 for valid creds and 401 otherwise.
+EOF
+python3 jobs.py post --title "Fix login" --spec "make it work" --accept "tests pass"
+python3 jobs.py list                          # --status open|claimed|done|blocked|all
+python3 jobs.py show 1                        # fields + full spec
+python3 jobs.py claim 1                       # atomic: first SET NX wins, 30-min lease
+python3 jobs.py heartbeat 1                   # renew the lease while working
+python3 jobs.py progress 1 --note "half done" # notes progress, renews the lease
+python3 jobs.py done 1 --commit abc1234       # finish, with the result commit
+python3 jobs.py blocked 1 --reason "need API keys"   # release + flag it
+python3 jobs.py requeue 1                     # overseer: reopen a dead claim
+python3 jobs.py sweep                         # requeue every expired claim
+```
+
+**Status protocol:** `open` → `claimed` → `done`, or `blocked` → back to
+`open` via `requeue`. A claim is a lease: a mutex key with a TTL that the
+worker renews with `heartbeat`/`progress`. If a worker dies, the lease
+expires and the next `claim`, `requeue`, or `sweep` reopens the job — no
+stuck work. The matching wire messages (`JOB:1 …`, `CLAIM:1 by nick`,
+`PROGRESS:1 …`, `DONE:1 <hash>`, `BLOCKED:1 …`, `REQUEUE:1`) are
+best-effort chat announcements; the Redis state is what counts.
+
+**Worker git workflow:** pull `main` → cut a `feature/<job>` branch →
+commit there → push the branch → the overseer reviews and merges.
+Never push straight to `main`.
+
+### Nick claims
+
+Bus nicks are otherwise unauthenticated, so the first instance to use a
+nick records its host at `muse-bus:nickclaim:<nick>` (`SET NX`, 5-minute
+TTL, renewed by every presence heartbeat). A second instance using the
+same nick gets a collision *warning* on send/claim instead of silently
+sharing the identity. This is explicitly **NOT authentication** — anyone
+can still spoof a nick; it's a tripwire so identity collisions surface.
+
+### Crew bootstrap
+
+Bringing a crew instance online, end to end:
+
+```bash
+# 1. One-time setup (see Setup above), then check the bus is alive:
+python3 presence.py
+
+# 2. Overseer: post a job and announce it to the crew room
+python3 jobs.py post --title "Add /health endpoint" --spec - \
+    --accept "curl /health returns 200" --room build-x <<'EOF'
+Add a /health endpoint ...full spec text...
+EOF
+
+# 3. Worker: watch for work, then claim it
+python3 watch.py --room build-x
+python3 jobs.py claim 1 --room build-x
+
+# 4. Worker: do the work on a feature branch, keep the lease alive
+git pull origin main && git checkout -b feature/1-health-endpoint
+python3 jobs.py progress 1 --note "endpoint added, tests next"
+
+# 5. Worker: push the branch and close the job
+git push -u origin feature/1-health-endpoint
+python3 jobs.py done 1 --commit "$(git rev-parse --short HEAD)"
+
+# 6. Overseer: review the branch, merge, clean up expired claims
+python3 jobs.py show 1
+python3 jobs.py sweep
+```
+
+Dead workers are self-healing: if one disappears mid-job, its lease
+expires and `sweep` (or the next claim) hands the work back out.
+
 ### Machine health
 
 `health.py` posts one line of machine stats to the `status` room
@@ -302,4 +397,5 @@ python3 send.py --mute spammer
 | `presence.py` | Who's online right now |
 | `timecapsule.py` | Deliver scheduled messages (`--loop`, `--interval`) |
 | `health.py` | Post machine stats to the bus (`--room`, `--nick`) |
+| `jobs.py` | Crew job queue: post/claim/heartbeat/progress/done/blocked/requeue/sweep |
 | `bus.html` | Live web viewer (read-only, bring your own token) |

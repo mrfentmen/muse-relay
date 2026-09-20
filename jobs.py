@@ -55,10 +55,6 @@ def _q(s):
     return urllib.parse.quote(str(s), safe="")
 
 
-def _uq(s):
-    return urllib.parse.unquote(s)
-
-
 def _seq_key():
     return f"{NS}seq"
 
@@ -80,9 +76,13 @@ def _index_key():
 
 
 def _hgetall(key):
+    # _hset URL-quotes field/value for the REST path; Upstash decodes each
+    # path segment before storing, so what comes back is already the
+    # original value. Do NOT unquote again here — a second decode would
+    # corrupt any literal "%XX" text in a stored value.
     raw = json.loads(api_get(f"hgetall/{key}"))["result"] or []
     it = iter(raw)
-    return {_uq(k): _uq(v) for k, v in zip(it, it)}
+    return dict(zip(it, it))
 
 
 def _hset(key, mapping):
@@ -289,6 +289,12 @@ def cmd_claim(args):
         })
     except Exception as e:
         print(f"RELAY_ERROR: claim record failed ({e})", file=sys.stderr)
+        # Roll back the mutex so the job stays open and claimable instead
+        # of claimed-but-unworkable until the lease expires.
+        try:
+            api_get(f"del/{_claim_key(args.id)}")
+        except Exception:
+            pass
         return 2
     w = _creator_warning(h)
     if w:
