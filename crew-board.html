@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>crew-board — muse-relay job queue</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0d1117; color: #e6edf3;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 10px 12px; background: #161b22; border-bottom: 1px solid #30363d;
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  header input {
+    background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 6px; padding: 7px 10px; font-size: 13px;
+  }
+  header input[type=text].url { width: 250px; }
+  header input[type=password] { width: 180px; }
+  header input.ns { width: 150px; }
+  header input#q { width: 200px; }
+  header button {
+    background: #238636; color: #fff; border: none; border-radius: 6px;
+    padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  #status { color: #8b949e; font-size: 12px; }
+  #status.err { color: #f85149; }
+  #board {
+    display: grid; grid-template-columns: repeat(4, minmax(240px, 1fr));
+    gap: 12px; padding: 12px; align-items: start;
+  }
+  @media (max-width: 900px) {
+    #board { grid-template-columns: 1fr; }
+  }
+  .col {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 8px; min-height: 120px;
+  }
+  .col h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: #8b949e; margin: 2px 4px 8px; display: flex;
+    justify-content: space-between;
+  }
+  .col h2 .n {
+    background: #30363d; border-radius: 10px; padding: 0 8px; color: #e6edf3;
+  }
+  .card {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    padding: 8px 10px; margin-bottom: 8px; cursor: pointer;
+  }
+  .card:hover, .card:focus { border-color: #79c0ff; outline: none; }
+  .card.selected { border-color: #79c0ff; box-shadow: 0 0 0 1px #79c0ff; }
+  .card .id { color: #8b949e; font-size: 11px; }
+  .card .title { font-weight: 600; margin: 2px 0 6px; }
+  .card .meta { font-size: 12px; color: #8b949e; }
+  .pill {
+    display: inline-block; font-size: 11px; border-radius: 10px;
+    padding: 1px 8px; margin-right: 6px;
+  }
+  .pill.signed { background: #1a472a; color: #7ee787; }
+  .pill.unsigned { background: #3a2b00; color: #d29922; }
+  .pill.claim { background: #1c2b4a; color: #79c0ff; }
+  .pill.status { background: #30363d; color: #e6edf3; }
+  .empty { color: #6e7681; font-size: 12px; padding: 8px 4px; font-style: italic; }
+  #hint { padding: 24px; color: #8b949e; max-width: 640px; }
+  #hint code { background: #161b22; padding: 1px 6px; border-radius: 4px; }
+  /* detail drawer */
+  #detail {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 20;
+    width: min(440px, 94vw); background: #161b22;
+    border-left: 1px solid #30363d; overflow-y: auto; padding: 14px 16px 32px;
+  }
+  #detail[hidden] { display: none; }
+  #detail .d-head { display: flex; align-items: flex-start; gap: 8px; }
+  #detail .d-head h3 { margin: 0; font-size: 15px; flex: 1; }
+  #detail .d-head .jid { color: #8b949e; font-size: 12px; }
+  #detailClose {
+    background: #30363d; color: #e6edf3; border: none; border-radius: 6px;
+    padding: 4px 10px; font-size: 13px; cursor: pointer; flex-shrink: 0;
+  }
+  #detail .kv { display: grid; grid-template-columns: 110px 1fr; gap: 2px 8px;
+    font-size: 12px; margin: 10px 0; }
+  #detail .kv dt { color: #8b949e; }
+  #detail .kv dd { margin: 0; overflow-wrap: anywhere; }
+  #detail h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: #8b949e; margin: 14px 0 6px; }
+  #detail pre {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; white-space: pre-wrap;
+    overflow-wrap: anywhere; margin: 0;
+  }
+  #detail .pills { margin: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>crew-board</h1>
+  <input id="url" class="url" type="text" placeholder="https://…upstash.io" autocomplete="off">
+  <input id="token" type="password" placeholder="REST token" autocomplete="off">
+  <input id="ns" class="ns" type="text" placeholder="job ns (muse-bus:job)" autocomplete="off">
+  <button id="go">Connect</button>
+  <input id="q" type="text" placeholder="filter: title, #id, claim…" autocomplete="off" aria-label="filter jobs">
+  <span id="status">not connected</span>
+</header>
+<div id="board" hidden>
+  <div class="col" id="col-open"><h2>open <span class="n">0</span></h2></div>
+  <div class="col" id="col-claimed"><h2>claimed <span class="n">0</span></h2></div>
+  <div class="col" id="col-blocked"><h2>blocked <span class="n">0</span></h2></div>
+  <div class="col" id="col-done"><h2>done <span class="n">0</span></h2></div>
+</div>
+<aside id="detail" hidden aria-label="job detail"></aside>
+<div id="hint">
+  Enter your Upstash <code>REST URL</code> and <code>REST token</code> to watch
+  the crew job queue live. They are kept in this browser's
+  <code>localStorage</code> only — nothing is sent anywhere except your
+  Upstash instance. Read-only: this page never writes.
+  Click any job card for its full spec, acceptance criteria and history.
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+const detailEl = $("detail");
+let timer = null, tickTimer = null;
+let JOBS = [];          // [{ jid, h }] newest first, last full fetch
+let selectedJid = null; // job id shown in the detail drawer, or null
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function setStatus(text, isErr) {
+  statusEl.textContent = text;
+  statusEl.className = isErr ? "err" : "";
+}
+
+async function api(path) {
+  const url = $("url").value.replace(/\/+$/, "");
+  const res = await fetch(url + path, {
+    headers: { "Authorization": "Bearer " + $("token").value }
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+function ns() {
+  const v = $("ns").value.trim();
+  return v || "muse-bus:job";
+}
+
+/* relative age, e.g. "5m ago" — used for the in-place ticker */
+function rel(ts) {
+  const n = Number(ts || 0);
+  if (!n) return "—";
+  const s = Math.max(0, Date.now() / 1000 - n);
+  if (s < 10) return "just now";
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+function abs(ts) {
+  const n = Number(ts || 0);
+  if (!n) return "—";
+  return new Date(n * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z";
+}
+
+function matches(h, jid, q) {
+  if (!q) return true;
+  const hay = [jid, h.title, h.claim, h.note, h.status, h.signed_by,
+               h.created_by, h.room, h.branch]
+    .map(v => String(v == null ? "" : v).toLowerCase()).join(" ");
+  return q.toLowerCase().split(/\s+/).every(tok => tok && hay.includes(tok));
+}
+
+function pills(h) {
+  const signed = !!h.signed_by;
+  const sig = signed
+    ? `<span class="pill signed" title="signed by ${esc(h.signed_by)}">signed</span>`
+    : `<span class="pill unsigned">unsigned</span>`;
+  const claim = h.claim ? `<span class="pill claim">${esc(h.claim)}</span>` : "";
+  const verified = h.verified ? `<span class="pill signed">verified</span>` : "";
+  return sig + claim + verified;
+}
+
+function cardHTML(jid, h) {
+  const sel = String(jid) === String(selectedJid) ? " selected" : "";
+  return `<div class="card${sel}" data-jid="${esc(jid)}" tabindex="0" role="button"` +
+    ` aria-label="job ${esc(jid)}: ${esc(h.title || "(no title)")} — open detail">` +
+    `<div class="id">#${esc(jid)}</div>` +
+    `<div class="title">${esc(h.title || "(no title)")}</div>` +
+    `<div class="meta">${pills(h)}` +
+    `<span class="age" data-ts="${esc(h.created_at || "")}" data-prefix="created ">` +
+    `created ${esc(rel(h.created_at))}</span>` +
+    (h.result_commit ? ` <span>commit ${esc(String(h.result_commit).slice(0, 8))}</span>` : "") +
+    (h.note ? `<div>${esc(h.note)}</div>` : "") +
+    `</div></div>`;
+}
+
+function render() {
+  const q = $("q").value.trim();
+  const cols = { open: [], claimed: [], blocked: [], done: [] };
+  let shown = 0;
+  for (const { jid, h } of JOBS) {
+    if (!matches(h, jid, q)) continue;
+    shown++;
+    const st = h.status || "open";
+    (cols[st] || cols.open).push(cardHTML(jid, h));
+  }
+  for (const [name, cards] of Object.entries(cols)) {
+    const col = $("col-" + name);
+    col.querySelector("h2 .n").textContent = cards.length;
+    col.querySelectorAll(".card,.empty").forEach(c => c.remove());
+    if (cards.length) {
+      col.insertAdjacentHTML("beforeend", cards.join(""));
+    } else if (JOBS.length && q) {
+      col.insertAdjacentHTML("beforeend", `<div class="empty">no matches</div>`);
+    }
+  }
+  if (!JOBS.length) {
+    $("col-open").insertAdjacentHTML("beforeend",
+      `<div class="empty">queue is empty</div>`);
+  }
+}
+
+/* history = the job's event trail, from its timestamp fields + notes */
+function historyRows(h) {
+  const rows = [];
+  const ev = (label, ts) => {
+    if (ts) rows.push([label, `${abs(ts)} (${rel(ts)})`, ts]);
+  };
+  ev("created", h.created_at);
+  ev("claimed", h.claimed_at);
+  ev("lease until", h.lease_until);
+  ev("done", h.done_at);
+  if (h.verified_at) ev("verified", h.verified_at);
+  if (h.expires_at) ev("spec expires", h.expires_at);
+  return rows;
+}
+
+function detailHTML(jid, h, spec) {
+  const kv = (k, v) => v ? `<dt>${esc(k)}</dt><dd>${v}</dd>` : "";
+  const hist = historyRows(h)
+    .map(([label, text, ts]) =>
+      `<dt>${esc(label)}</dt><dd><span data-ts="${esc(ts)}" data-relonly="1">${esc(text)}</span></dd>`)
+    .join("");
+  return `<div class="d-head"><div><div class="jid">#${esc(jid)}</div>` +
+    `<h3>${esc(h.title || "(no title)")}</h3></div>` +
+    `<button id="detailClose" aria-label="close detail">✕</button></div>` +
+    `<div class="pills"><span class="pill status">${esc(h.status || "open")}</span>${pills(h)}</div>` +
+    `<dl class="kv">` +
+    kv("claim", h.claim ? `${esc(h.claim)}${h.claim_host ? " @ " + esc(h.claim_host) : ""}` : "") +
+    kv("room", h.room ? esc(h.room) : "") +
+    kv("branch", h.branch ? esc(h.branch) : "") +
+    kv("created by", h.created_by ? esc(h.created_by) + (h.created_host ? " @ " + esc(h.created_host) : "") : "") +
+    kv("signed by", h.signed_by ? esc(h.signed_by) : "") +
+    kv("result", h.result_commit ? esc(h.result_commit) : "") +
+    hist +
+    `</dl>` +
+    (h.note ? `<h4>note</h4><pre>${esc(h.note)}</pre>` : "") +
+    (h.verify_report ? `<h4>verify report</h4><pre>${esc(h.verify_report)}</pre>` : "") +
+    `<h4>acceptance criteria</h4><pre>${esc(h.accept || "(none recorded)")}</pre>` +
+    `<h4>full spec</h4><pre>${esc(spec == null ? "(no spec stored)" : spec)}</pre>`;
+}
+
+async function fetchJob(jid) {
+  const raw = (await api("/hgetall/" + encodeURIComponent(ns() + ":" + jid))).result || [];
+  const h = {};
+  for (let i = 0; i + 1 < raw.length; i += 2) h[raw[i]] = raw[i + 1];
+  const spec = (await api("/get/" + encodeURIComponent(ns() + ":" + jid + ":spec"))).result;
+  return { h, spec };
+}
+
+async function refreshDetail() {
+  if (selectedJid == null) return;
+  try {
+    const { h, spec } = await fetchJob(selectedJid);
+    const i = JOBS.findIndex(j => String(j.jid) === String(selectedJid));
+    if (i >= 0) { JOBS[i].h = h; render(); }
+    detailEl.innerHTML = detailHTML(selectedJid, h, spec);
+    bindDetailClose();
+  } catch (e) { /* keep the stale pane; the status line shows the error */ }
+}
+
+async function openDetail(jid) {
+  selectedJid = jid;
+  detailEl.hidden = false;
+  const cached = JOBS.find(j => String(j.jid) === String(jid));
+  detailEl.innerHTML = cached
+    ? detailHTML(jid, cached.h, "(loading…)") : "<p>loading…</p>";
+  bindDetailClose();
+  render(); // mark the selected card
+  await refreshDetail();
+}
+
+function closeDetail() {
+  selectedJid = null;
+  detailEl.hidden = true;
+  detailEl.innerHTML = "";
+  render();
+}
+
+function bindDetailClose() {
+  const b = $("detailClose");
+  if (b) b.addEventListener("click", closeDetail);
+}
+
+async function poll() {
+  try {
+    const prefix = ns();
+    const ids = (await api("/zrange/" + encodeURIComponent(prefix + "index") + "/0/-1")).result || [];
+    const jobs = [];
+    for (const jid of ids.slice().reverse()) { // newest first
+      const raw = (await api("/hgetall/" + encodeURIComponent(prefix + ":" + jid))).result || [];
+      const h = {};
+      for (let i = 0; i + 1 < raw.length; i += 2) h[raw[i]] = raw[i + 1];
+      jobs.push({ jid, h });
+    }
+    JOBS = jobs;
+    render();
+    if (selectedJid != null) refreshDetail();
+    const q = $("q").value.trim();
+    setStatus("live — " + JOBS.length + " jobs" + (q ? ` (filter: "${q}")` : ""));
+  } catch (e) {
+    setStatus("poll failed: " + e.message, true);
+  }
+}
+
+/* lightweight ticker: refresh relative ages in place, no re-render */
+function tick() {
+  document.querySelectorAll("[data-ts]").forEach(el => {
+    const ts = el.getAttribute("data-ts");
+    const r = rel(ts);
+    if (el.hasAttribute("data-relonly")) {
+      // detail history rows carry "abs (rel)"; rebuild both parts
+      el.textContent = abs(ts) + " (" + r + ")";
+    } else {
+      el.textContent = (el.getAttribute("data-prefix") || "") + r;
+    }
+  });
+}
+
+$("go").addEventListener("click", () => {
+  if (!$("url").value.trim() || !$("token").value) {
+    setStatus("enter the REST URL and token first", true);
+    return;
+  }
+  try {
+    localStorage.setItem("crew-url", $("url").value.trim());
+    localStorage.setItem("crew-token", $("token").value);
+    localStorage.setItem("crew-ns", $("ns").value.trim());
+  } catch (e) { /* private mode — just don't persist */ }
+  if (timer) clearInterval(timer);
+  if (tickTimer) clearInterval(tickTimer);
+  $("hint").hidden = true;
+  $("board").hidden = false;
+  setStatus("connecting…");
+  poll();
+  timer = setInterval(poll, 5000);
+  tickTimer = setInterval(tick, 20000);
+  $("go").textContent = "Reconnect";
+});
+
+$("q").addEventListener("input", () => { render(); });
+
+$("board").addEventListener("click", ev => {
+  const card = ev.target.closest(".card");
+  if (!card) return;
+  const jid = card.getAttribute("data-jid");
+  if (String(jid) === String(selectedJid)) closeDetail();
+  else openDetail(jid);
+});
+
+$("board").addEventListener("keydown", ev => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const card = ev.target.closest(".card");
+  if (!card) return;
+  ev.preventDefault();
+  openDetail(card.getAttribute("data-jid"));
+});
+
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape" && selectedJid != null) closeDetail();
+});
+
+(function init() {
+  try {
+    $("url").value = localStorage.getItem("crew-url") || "";
+    $("token").value = localStorage.getItem("crew-token") || "";
+    $("ns").value = localStorage.getItem("crew-ns") || "";
+  } catch (e) { /* ignore */ }
+})();
+</script>
+</body>
+</html>
