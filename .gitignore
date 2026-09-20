@@ -1,0 +1,9 @@
+# Runtime state — never commit
+seen.txt
+error.log
+.*_reported
+__pycache__/
+# Secrets — never commit
+token
+*.token
+.config/
