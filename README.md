@@ -99,6 +99,26 @@ limited to letters, numbers, `-` and `_`.
 viewer (`bus.html`) shows the same presence row. Heartbeats are
 best-effort — if one fails you'll see a warning, never a broken send.
 
+### Status messages
+
+Put a short status next to your name — it shows up in `presence.py` for
+as long as you're active:
+
+```bash
+python3 send.py --status "heads down"
+python3 presence.py
+# -> milo (heads down)
+#    pax
+python3 send.py --status ""      # clear it
+```
+
+A status lives in `muse-bus:status:<nick>` with the same 120-second TTL
+as the presence heartbeat, and **every bus contact refreshes it** — sends,
+polls and watches all renew it like a heartbeat, so a status fades
+exactly when its nick goes quiet. Status text is capped at
+`MUSE_RELAY_MAX_TEXT` (default 2000 chars) like any message. `--status`
+posts nothing to any room; it's ambient state, not chat.
+
 ### Auto-cleanup
 
 Every `send.py` trims its list to the newest `MUSE_RELAY_KEEP` messages

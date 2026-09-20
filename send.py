@@ -41,6 +41,11 @@ Idempotent: skips the send if the identical message is already at the tail.
               mute/unmute a nick in the room (muse-bus:muted:<room> set)
               and post a "<nick>: MUTE:<N>" / "UNMUTE:<N>" notice.
   --desc TEXT set the room's description (room directory); posts nothing.
+  --status TEXT
+              set your status ("heads down", "in a call"). Lives 120s,
+              refreshed by every send/poll/watch contact like a
+              heartbeat; presence.py shows it next to your nick. Empty
+              string clears it. Obeys MAX_TEXT. Posts nothing.
   --topic TEXT post "<nick>: TOPIC: <text>" (empty string clears it).
   --dm SECRET private dead-drop room derived as dm-<sha1(secret)[:12]>.
               Overrides --room. This is obscurity, NOT encryption: anyone
@@ -68,7 +73,7 @@ from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
     bus_push, bus_trim, clean_room, clip_put, dm_room, img_put, mod_add,
     mod_del, mute_add, mute_del, nick_conflict_holder, presence_beat,
-    recur_add, room_set_desc, room_touch, typing_ping)
+    recur_add, room_set_desc, room_touch, status_set, typing_ping)
 import clipboard  # noqa: E402
 import store  # noqa: E402
 
@@ -307,6 +312,9 @@ def main(argv=None):
                          "notice")
     ap.add_argument("--desc", default=None, metavar="TEXT",
                     help="set the room description; posts nothing")
+    ap.add_argument("--status", default=None, metavar="TEXT",
+                    help="set your status text ('' clears it); lives 120s "
+                         "and is refreshed by bus activity; posts nothing")
     ap.add_argument("--topic", default=None, metavar="TEXT",
                     help="post '<nick>: TOPIC: <text>' (empty clears)")
     ap.add_argument("message", nargs="?", default=None,
@@ -323,7 +331,8 @@ def main(argv=None):
                       or args.img or args.mute or args.unmute
                       or args.topic is not None or args.message
                       or args.typing or args.desc is not None
-                      or args.mod_add or args.mod_del):
+                      or args.mod_add or args.mod_del
+                      or args.status is not None):
         print("ERROR: --clip doesn't combine with other modes or message "
               "text", file=sys.stderr)
         return 2
@@ -337,13 +346,15 @@ def main(argv=None):
         return 2
     ops = [bool(args.every), bool(args.typing), args.desc is not None,
            bool(args.mod_add), bool(args.mod_del),
-           bool(args.mute), bool(args.unmute), args.topic is not None]
+           bool(args.mute), bool(args.unmute), args.topic is not None,
+           args.status is not None]
     if sum(ops) > 1:
         print("ERROR: only one of --every/--typing/--desc/--mod-add/"
-              "--mod-del/--mute/--unmute/--topic per invocation",
+              "--mod-del/--mute/--unmute/--topic/--status per invocation",
               file=sys.stderr)
         return 2
-    if (args.mute or args.unmute or args.topic is not None) and args.message:
+    if ((args.mute or args.unmute or args.topic is not None
+         or args.status is not None) and args.message):
         print("ERROR: --mute/--unmute/--topic don't combine with message "
               "text", file=sys.stderr)
         return 2
@@ -445,6 +456,23 @@ def main(argv=None):
 
     if args.topic is not None:
         return post_message(f"TOPIC: {args.topic}", key)
+
+    if args.status is not None:
+        text = args.status.strip()
+        try:
+            status_set(text)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"RELAY_ERROR: status set failed ({e})", file=sys.stderr)
+            return 2
+        beat()
+        if text:
+            print(f"STATUS_SET {NICK}: {text}")
+        else:
+            print(f"STATUS_CLEARED {NICK}")
+        return 0
 
     text = args.message.strip() if args.message else ""
     blob_info = None

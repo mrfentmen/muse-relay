@@ -72,13 +72,81 @@ def _presence_key(nick):
     return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
 
 
+# --- Status messages -----------------------------------------------------#
+# A nick can carry a free-text status ("heads down", "in a call") that
+# lives at muse-bus:status:<nick> with the same 120s TTL as presence:
+# every presence beat renews it, so it fades when the nick goes quiet.
+# Empty text clears it.
+
+STATUS_TTL = PRESENCE_TTL  # 120s, renewed like a heartbeat
+
+
+def status_key(nick=None):
+    """Redis key holding a nick's status text."""
+    return "muse-bus:status:" + urllib.parse.quote(nick or NICK, safe="")
+
+
+def status_set(text, nick=None):
+    """Set this nick's status; empty text clears it.
+
+    Raises ValueError when text exceeds MAX_TEXT (same limit as send).
+    """
+    nick = nick or NICK
+    if text:
+        if len(text) > MAX_TEXT:
+            raise ValueError(
+                f"status too long ({len(text)} chars; max {MAX_TEXT})")
+        q = urllib.parse.quote(text, safe="")
+        api_get(f"setex/{status_key(nick)}/{STATUS_TTL}/{q}")
+    else:
+        api_get(f"del/{status_key(nick)}")
+
+
+def status_get(nick):
+    """Return nick's live status text, or None when unset/expired."""
+    try:
+        cur = json.loads(api_get(f"get/{status_key(nick)}"))["result"]
+    except Exception:
+        return None
+    return cur or None
+
+
+def status_get_many(nicks):
+    """Return {nick: status} for the nicks that have one (one MGET)."""
+    nicks = list(nicks)
+    if not nicks:
+        return {}
+    keys = "/".join(status_key(n) for n in nicks)
+    data = json.loads(api_get(f"mget/{keys}"))
+    vals = data.get("result") or []
+    return {n: v for n, v in zip(nicks, vals) if v}
+
+
+def status_refresh():
+    """Renew this nick's status TTL; no-op when none is set.
+
+    Called from presence_beat so a status fades exactly when the nick
+    goes quiet. Best-effort: a failed refresh never breaks the beat.
+    """
+    try:
+        cur = json.loads(api_get(f"get/{status_key()}"))["result"]
+    except Exception:
+        return
+    if cur:
+        try:
+            api_get(f"expire/{status_key()}/{STATUS_TTL}")
+        except Exception:
+            pass
+
+
 def presence_beat(roomkey=None):
     """Heartbeat: mark this nick online for PRESENCE_TTL seconds.
 
     Called automatically by send.py, poll.py and watch.py on successful
     bus contact. When roomkey is given, also marks the nick present in
-    that specific room. Also renews this instance's nick claim (see
-    nick_claim). Best-effort — callers should not fail if this does.
+    that specific room. Also renews this instance's nick claim and the
+    nick's status message TTL, if one is set. Best-effort — callers
+    should not fail if this does.
     """
     q = urllib.parse.quote(NICK, safe="")
     api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
@@ -88,6 +156,10 @@ def presence_beat(roomkey=None):
                 f"{PRESENCE_TTL}/1")
     try:
         nick_claim()
+    except Exception:
+        pass
+    try:
+        status_refresh()
     except Exception:
         pass
 
