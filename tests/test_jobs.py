@@ -412,3 +412,152 @@ class SignedJobTest(RelayTestCase):
 
 
 if __name__ == "__main__":    unittest.main()
+
+
+class HardeningTest(RelayTestCase):
+    """v2 hardening: key ids, expiry, jid-bound signatures, loud rejections."""
+
+    def setUp(self):
+        super().setUp()
+        self.keyring = os.path.join(self.tmp, "keyring")
+        with open(self.keyring, "w") as f:
+            f.write("crew-2026-09:crew-secret-abc\n")
+            f.write("crew-2026-10:crew-secret-def\n")
+        self.legacy = os.path.join(self.tmp, "legacy-secret")
+        with open(self.legacy, "wb") as f:
+            f.write(b"crew-secret-abc\n")
+
+    def post_signed(self, *extra):
+        argv = ["post", "--title", "T", "--spec", "s",
+                "--secret-file", self.keyring] + list(extra)
+        rc, out, err = self.run_cli(jobs.main, argv)
+        self.assertEqual(rc, 0, err)
+        return out
+
+    def test_post_defaults_to_first_kid(self):
+        self.post_signed()
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["sig_kid"], "crew-2026-09")
+        self.assertEqual(h["sig_v"], "2")
+        self.assertTrue(h["nonce"])
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_post_explicit_kid(self):
+        self.post_signed("--kid", "crew-2026-10")
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["sig_kid"], "crew-2026-10")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_post_unknown_kid_rejected(self):
+        rc, out, err = self.run_cli(
+            jobs.main, ["post", "--title", "T", "--spec", "s",
+                        "--secret-file", self.keyring, "--kid", "nope"])
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown kid", err)
+
+    def test_verify_unknown_kid_is_bad(self):
+        self.post_signed("--kid", "crew-2026-10")
+        other = os.path.join(self.tmp, "other-ring")
+        with open(other, "w") as f:
+            f.write("crew-2026-09:crew-secret-abc\n")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", other])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_legacy_single_token_file_still_works(self):
+        rc, out, err = self.run_cli(
+            jobs.main, ["post", "--title", "T", "--spec", "s",
+                        "--secret-file", self.legacy])
+        self.assertEqual(rc, 0, err)
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["sig_kid"], "default")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.legacy])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_v1_signature_still_verifies(self):
+        # a job signed before the v2 upgrade (old payload, no sig_v)
+        import hashlib
+        import hmac as hmac_mod
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        payload = {"title": "T", "spec": "s", "accept": "",
+                   "branch": "", "base": "", "room": ""}
+        canon = json.dumps(payload, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+        sig = hmac_mod.new(b"crew-secret-abc", canon,
+                           hashlib.sha256).hexdigest()
+        jobs._hset(jobs._job_key("1"), {"sig": sig, "signed_by": "tester"})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.legacy])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_expiry(self):
+        self.post_signed("--expires", "3600")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(out.strip(), "OK")
+        self.fake.advance(3601)
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "EXPIRED")
+
+    def test_claim_refuses_expired_and_alerts(self):
+        self.post_signed("--expires", "3600")
+        self.fake.advance(7200)
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertIn("EXPIRED", err)
+        alerts = self.pushes_to("muse-bus")
+        self.assertTrue(any("REJECTED:1 EXPIRED" in a for a in alerts),
+                        alerts)
+
+    def test_claim_refuses_tampered_and_alerts(self):
+        self.post_signed()
+        jobs._hset(jobs._job_key("1"), {"title": "TAMPERED"})
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertIn("BAD", err)
+        alerts = self.pushes_to("muse-bus")
+        self.assertTrue(any("REJECTED:1 BAD" in a for a in alerts), alerts)
+
+    def test_transplanted_signature_fails(self):
+        # a signature lifted from job 1 does not verify on job 2:
+        # the signature is bound to the exact job id
+        self.post_signed()
+        self.post_signed()
+        h1, _ = jobs.job_get("1")
+        jobs._hset(jobs._job_key("2"), {
+            "sig": h1["sig"], "sig_v": "2", "sig_kid": h1["sig_kid"],
+            "signed_by": h1["signed_by"], "nonce": h1["nonce"],
+            "expires_at": h1.get("expires_at", "")})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "2", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_show_displays_sig_fields(self):
+        self.post_signed("--expires", "3600")
+        rc, out, _ = self.run_cli(jobs.main, ["show", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("sig_kid: crew-2026-09", out)
+        self.assertIn("sig_v: 2", out)
+        self.assertIn("nonce: ", out)
+
+    def test_unsigned_claim_still_allowed_with_warning(self):
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertIn("unsigned", err)
