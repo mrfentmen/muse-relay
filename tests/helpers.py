@@ -23,6 +23,7 @@ import saved  # noqa: E402
 import digest  # noqa: E402
 import announce  # noqa: E402
 import timecapsule  # noqa: E402
+import export  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 

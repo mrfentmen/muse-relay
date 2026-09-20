@@ -73,6 +73,7 @@ python3 digest.py --json                  # all rooms, machine-readable
 python3 announce.py set --room news       # become #news announcer
 python3 poll.py --room news --announce    # only the announcer's lines
 python3 send.py --pomodoro 25m "write docs"   # start a pomodoro timer
+python3 export.py --room news --format md   # export #news history
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -503,6 +504,24 @@ remaining time, e.g. `TIMER tester: write docs — 24m 12s left`), and a
 time-capsule item is scheduled so `timecapsule.py` posts the
 `POMODORO-DONE` line when the timer ends. The label is the message
 text; `--pomodoro` doesn't combine with the other send modes.
+
+### Room export
+
+Archive a room's history to markdown or JSON:
+
+```bash
+python3 export.py --room news --format md > news.md
+python3 export.py --room news --format json --out news.jsonl
+```
+
+Markdown renders `## <nick> (<YYYY-MM-DD HH:MM:SS>)` followed by the
+text, with an `(edited)` marker where edits happened. JSON is one
+object per line: `{"nick", "text", "ts"}` (plus `"edited": true` when
+relevant). The store file is read line by line and output is written
+incrementally, so even huge rooms stream through in constant memory.
+Scope, honestly: this exports your machine's **local** history (your
+sends plus what you polled or watched) — the only record that carries
+real timestamps. Purely local: no network, no token involved.
 
 ### Machine health
 
