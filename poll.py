@@ -56,7 +56,7 @@ def main(argv=None):
         print(f"RELAY_ERROR: {e}")
         return 2
     try:
-        presence_beat()
+        presence_beat(key)
     except Exception as e:
         log_error(f"presence heartbeat failed: {e}")
     new = [m for m in msgs

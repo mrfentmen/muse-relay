@@ -50,6 +50,31 @@
     border-left: 1px solid #21262d; background: #010409; font-size: 13px;
   }
   #panels:empty { display: none; }
+  #topicbar {
+    padding: 8px 14px; background: #0d1117; border-bottom: 1px solid #21262d;
+    font-size: 13px; color: #e6edf3;
+  }
+  #topicbar .tlabel { color: #8b949e; margin-right: 6px; }
+  #typingbar { color: #8b949e; font-size: 12px; margin-left: 10px; font-style: italic; }
+  #searchbar { padding: 6px 0 10px; display: flex; gap: 8px; align-items: center; }
+  #searchbar input {
+    flex: 1; background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  #searchbar #qcount { color: #8b949e; font-size: 12px; }
+  .msg mark { background: #9e6a03; color: #fff; border-radius: 2px; padding: 0 1px; }
+  .replies { margin: 4px 0 2px 18px; border-left: 2px solid #30363d; padding-left: 8px; }
+  .replies .msg { font-size: 12.5px; }
+  .rxn { display: inline-block; margin: 2px 6px 0 0; font-size: 12px; color: #8b949e;
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 0 7px; }
+  .rxn b { color: #e6edf3; font-weight: 600; }
+  .threadtoggle { cursor: pointer; color: #58a6ff; font-size: 11.5px; margin-left: 8px; }
+  .prow img.blobimg { max-width: 100%; max-height: 320px; border-radius: 6px;
+    border: 1px solid #30363d; display: block; margin-top: 4px; }
+  .drow { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0;
+    border-bottom: 1px solid #161b22; font-size: 12.5px; }
+  .drow .dmeta { color: #8b949e; font-size: 11.5px; }
+  .mutedmsg { opacity: 0.35; }
   #panels details {
     border: 1px solid #21262d; border-radius: 6px; margin-bottom: 8px;
     background: #0d1117;
@@ -119,10 +144,12 @@
   <button id="go">Connect</button>
   <button id="notifyBtn" title="Get a browser notification when someone @-mentions your nick">Notify me</button>
   <span id="status">not connected</span>
+  <span id="typingbar"></span>
 </header>
 <div id="presence" hidden></div>
+<div id="topicbar" hidden></div>
 <div id="main">
-<div id="log"><div id="hint">
+<div id="log"><div id="searchbar" hidden><input id="q" type="text" placeholder="search loaded history…" autocomplete="off"><span id="qcount"></span></div><div id="hint">
   Enter your Upstash <code>REST URL</code> and <code>REST token</code> to watch
   the bus live. They are kept in this browser's <code>localStorage</code> only —
   nothing is sent anywhere except your Upstash instance, and nothing is
@@ -219,6 +246,7 @@ function roomName() {
 window.busHooks = { message: [], connect: [], poll: [] };
 window.busUtil = {
   esc, nickColor, api, busKey, roomName, myNick, setStatus,
+  el: id => document.getElementById(id),
   // Creates (or returns) a <details> panel section with the given id.
   panel(id, title) {
     const panels = $("panels");
@@ -324,6 +352,8 @@ $("go").addEventListener("click", () => {
   primed = false;  // don't notify for the backlog we're about to load
   log.innerHTML = "";
   $("panels").innerHTML = "";  // features rebuild on the connect hook
+  $("topicbar").hidden = true; $("topicbar").innerHTML = "";
+  $("typingbar").textContent = "";
   setStatus("connecting…");
   poll();
   pollPresence();
@@ -1190,6 +1220,25 @@ try {
     );
   }
 
+  // Sniff common image formats by magic bytes; returns a MIME string or null.
+  function sniffImage(bytes) {
+    try {
+      if (!bytes || bytes.length < 4) return null;
+      var b = bytes;
+      if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47)
+        return "image/png";
+      if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF)
+        return "image/jpeg";
+      if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38)
+        return "image/gif"; // GIF87a / GIF89a
+      if (bytes.length >= 12 &&
+          b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+          b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50)
+        return "image/webp"; // RIFF....WEBP
+      return null;
+    } catch (e) { return null; }
+  }
+
   function renderInto(box, rec) {
     try { box.className = ""; } catch (e) {}
     if (rec.isText) {
@@ -1204,10 +1253,11 @@ try {
           "</pre>";
       } catch (e) { box.textContent = t.slice(0, 500); }
     } else {
+      var mime = sniffImage(rec.bytes);
       var url;
       try {
         url = URL.createObjectURL(
-          new Blob([rec.bytes], { type: "application/octet-stream" }));
+          new Blob([rec.bytes], { type: mime || "application/octet-stream" }));
       } catch (e) {
         try {
           box.textContent = "binary blob (" + rec.bytes.length +
@@ -1217,11 +1267,21 @@ try {
       }
       try {
         box.innerHTML = "";
+        if (mime) {
+          // Image: inline <img> plus a small download link underneath.
+          var img = document.createElement("img");
+          img.className = "blobimg";
+          img.setAttribute("style", "max-width:100%;display:block;margin:4px 0");
+          img.src = url;
+          img.alt = rec.name;
+          box.appendChild(img);
+        }
         var a = document.createElement("a");
         a.href = url;
         a.download = rec.name;
         a.textContent = "⬇ download " + rec.name +
-          " (" + rec.bytes.length + " bytes, binary)";
+          " (" + rec.bytes.length + " bytes" +
+          (mime ? ", " + mime : ", binary") + ")";
         box.appendChild(a);
       } catch (e) {
         try { box.textContent = "binary blob ready (" + rec.bytes.length + " bytes)"; }
@@ -1262,7 +1322,7 @@ try {
   try {
     window.__blobTest = {
       parseBlob: parseBlob, fetchBlob: fetchBlob, renderInto: renderInto,
-      b64ToBytes: b64ToBytes, cache: cache
+      b64ToBytes: b64ToBytes, sniffImage: sniffImage, cache: cache
     };
   } catch (e) {}
 })();
@@ -1640,6 +1700,785 @@ try {
   } catch (e) {}
 })();
 // === feature: dead-drops ===
+// === feature: threads ===
+// feature: threads — RE:<n> replies nest under the parent message.
+// Self-contained IIFE: uses window.busHooks + window.busUtil only.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.message || !H.message.push ||
+      typeof document === "undefined") return;
+
+  var cur = null;        // room this state belongs to
+  var elByIdx = {};      // idx -> element (main-log el, or thread copy for replies)
+  var threads = {};      // parentIdx -> {count, box, tg, collapsed, boxParent}
+
+  function nickSpan(nick) {
+    var c = "#c9d1d9";
+    try { c = U.nickColor(nick) || c; } catch (e) { /* keep default */ }
+    return '<span class="nick" style="color:' + c + '">' +
+      U.esc(nick) + "</span>";
+  }
+
+  function onMessage(m) {
+    try {
+      if (!m || typeof m.idx !== "number") return;
+      if (m.room !== cur) { cur = m.room; elByIdx = {}; threads = {}; }
+      if (m.el) elByIdx[m.idx] = m.el;
+
+      var mt = /^RE:(\d+)(?:\s+([\s\S]*))?$/.exec(m.text || "");
+      if (!mt) return;
+      var n = parseInt(mt[1], 10);
+      var body = (mt[2] || "").trim();
+      if (!body) return;        // empty reply ignored
+      if (n === m.idx) return;  // self-reference ignored
+
+      var parent = elByIdx[n];
+      if (parent && m.el && parent !== m.el) {
+        var rd = document.createElement("div");
+        rd.className = "msg";
+        rd.innerHTML = nickSpan(m.nick) +
+          '<span class="pill">\u21A9 #' + n + "</span>" +
+          "<span>" + U.esc(body) + "</span>";
+
+        var st = threads[n];
+        if (!st || st.boxParent !== parent) {
+          // New generation (or first reply): fresh container + toggle.
+          st = threads[n] = { count: 0, box: null, tg: null,
+                              collapsed: false, boxParent: parent };
+        }
+        if (!st.box) {
+          st.box = document.createElement("div");
+          st.box.className = "replies";
+          parent.appendChild(st.box);
+        }
+        st.box.appendChild(rd);
+        elByIdx[m.idx] = rd;  // replies-to-replies nest under the copy
+
+        st.count++;
+        if (!st.tg) {
+          var tg = document.createElement("span");
+          tg.className = "threadtoggle";
+          tg.addEventListener("click", function () {
+            st.collapsed = !st.collapsed;
+            if (st.box) st.box.style.display = st.collapsed ? "none" : "";
+            tg.textContent = (st.collapsed ? "\u25B8 " : "\u25BE ") +
+              st.count + " replies";
+          });
+          parent.appendChild(tg);
+          st.tg = tg;
+        }
+        st.tg.textContent = (st.collapsed ? "\u25B8 " : "\u25BE ") +
+          st.count + " replies";
+      } else if (m.el) {
+        // Parent unknown (trimmed from history) — mark the reply in place.
+        var sp = document.createElement("span");
+        sp.className = "pill";
+        sp.textContent = "\u21A9 #" + n;
+        m.el.insertBefore(sp, m.el.firstChild || null);
+      }
+    } catch (e) { /* a broken feature must not kill the log */ }
+  }
+
+  function onConnect(ctx) {
+    try {
+      if (ctx && ctx.room !== cur) {
+        cur = ctx.room; elByIdx = {}; threads = {};
+      }
+      // Same-room reconnect: message hooks already replayed the backlog.
+    } catch (e) { /* ignore */ }
+  }
+
+  H.message.push(onMessage);
+  H.connect.push(onConnect);
+
+  window.__busTest2 = window.__busTest2 || {};
+  window.__busTest2.threads = {
+    ingest: onMessage,
+    reset: function () { cur = null; elByIdx = {}; threads = {}; },
+    snapshot: function () {
+      var counts = {}, k;
+      for (k in threads) {
+        counts[k] = { n: threads[k].count,
+                      collapsed: threads[k].collapsed };
+      }
+      return { room: cur, counts: counts,
+               els: Object.keys(elByIdx).length };
+    }
+  };
+})();
+
+// === feature: pins ===
+// feature: pins — PIN:<n> pins a message, UNPIN:<n> removes it.
+// Renders a "Pins" panel listing pinned messages oldest-first.
+// Self-contained IIFE: uses window.busHooks + window.busUtil only.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.message || !H.message.push || !U.panel || !U.esc) return;
+
+  var cur = null;      // room this state belongs to
+  var pins = {};       // idx -> true
+  var meta = {};       // idx -> {nick, text} (built from every message seen)
+
+  function render() {
+    try {
+      var body = U.panel("pins", "\uD83D\uDCCC Pins");
+      var ids = Object.keys(pins).map(Number).sort(function (a, b) {
+        return a - b;
+      });
+      if (!ids.length) {
+        body.innerHTML = '<div class="prow">nothing pinned</div>';
+        return;
+      }
+      body.innerHTML = ids.map(function (n) {
+        var mt = meta[n];
+        var label = mt ? U.esc(mt.nick) + ": " + U.esc(mt.text)
+                       : "(not loaded)";
+        return '<div class="prow">#' + n + " " + label + "</div>";
+      }).join("");
+    } catch (e) { /* never break the log */ }
+  }
+
+  function onMessage(m) {
+    try {
+      if (!m || typeof m.idx !== "number") return;
+      if (m.room !== cur) { cur = m.room; pins = {}; meta = {}; }
+      meta[m.idx] = { nick: m.nick, text: m.text };
+
+      var pm = /^PIN:\s*(\d+)\s*$/.exec(m.text || "");
+      var um = /^UNPIN:\s*(\d+)\s*$/.exec(m.text || "");
+      if (pm) {
+        pins[parseInt(pm[1], 10)] = true;
+        render();
+      } else if (um) {
+        delete pins[parseInt(um[1], 10)];
+        render();
+      } else if (pins[m.idx]) {
+        // A newly arrived message resolves a previously unknown pin.
+        render();
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function onConnect(ctx) {
+    try {
+      if (ctx && ctx.room !== cur) {
+        cur = ctx.room; pins = {}; meta = {};
+      }
+      render();  // rebuild from replayed backlog
+    } catch (e) { /* ignore */ }
+  }
+
+  function onPoll() {
+    try { render(); } catch (e) { /* ignore */ }
+  }
+
+  H.message.push(onMessage);
+  H.connect.push(onConnect);
+  H.poll.push(onPoll);
+
+  window.__busTest2 = window.__busTest2 || {};
+  window.__busTest2.pins = {
+    ingest: onMessage,
+    reset: function () { cur = null; pins = {}; meta = {}; },
+    snapshot: function () {
+      return {
+        room: cur,
+        pinned: Object.keys(pins).map(Number).sort(function (a, b) {
+          return a - b;
+        })
+      };
+    }
+  };
+})();
+
+// === feature: reactions ===
+// feature: reactions — REACT:<n> <emoji> tallies emoji votes under a message.
+// One nick = one vote per (idx, emoji). Re-sending the same vote is a no-op.
+// Self-contained IIFE: uses window.busHooks + window.busUtil only.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.message || !H.message.push ||
+      typeof document === "undefined") return;
+
+  var cur = null;      // room this state belongs to
+  var elByIdx = {};    // idx -> message element
+  var rxns = {};       // idx -> { emoji -> { nick -> true } }
+
+  function renderRow(n, target) {
+    var row = target.querySelector(".rxnrow");
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "rxnrow";
+      target.appendChild(row);
+    }
+    var bucket = rxns[n] || {};
+    var list = Object.keys(bucket).map(function (em) {
+      return { em: em, c: Object.keys(bucket[em]).length };
+    });
+    list.sort(function (a, b) {
+      return b.c - a.c || (a.em < b.em ? -1 : (a.em > b.em ? 1 : 0));
+    });
+    row.innerHTML = list.map(function (e) {
+      return '<span class="rxn">' + U.esc(e.em) +
+        " <b>" + e.c + "</b></span>";
+    }).join("");
+  }
+
+  function onMessage(m) {
+    try {
+      if (!m || typeof m.idx !== "number") return;
+      if (m.room !== cur) { cur = m.room; elByIdx = {}; rxns = {}; }
+      if (m.el) elByIdx[m.idx] = m.el;
+
+      var rm = /^REACT:(\d+)\s+(\S+)/.exec(m.text || "");
+      if (!rm) return;
+      var n = parseInt(rm[1], 10);
+      // First whitespace-delimited token, capped at 12 chars
+      // (Array.from keeps multi-code-unit emoji intact).
+      var em = Array.from(rm[2]).slice(0, 12).join("");
+      if (!em) return;
+
+      var target = elByIdx[n];
+      if (!target) return;  // unknown idx ignored
+
+      var bucket = rxns[n] || (rxns[n] = {});
+      var voters = bucket[em] || (bucket[em] = {});
+      voters[m.nick] = true;
+      renderRow(n, target);
+    } catch (e) { /* never break the log */ }
+  }
+
+  function onConnect(ctx) {
+    try {
+      if (ctx && ctx.room !== cur) {
+        cur = ctx.room; elByIdx = {}; rxns = {};
+        return;
+      }
+      // Same-room reconnect: message hooks replayed the backlog;
+      // re-attach rows to the fresh elements.
+      Object.keys(rxns).forEach(function (k) {
+        var t = elByIdx[k];
+        if (t) renderRow(parseInt(k, 10), t);
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  H.message.push(onMessage);
+  H.connect.push(onConnect);
+
+  window.__busTest2 = window.__busTest2 || {};
+  window.__busTest2.reactions = {
+    ingest: onMessage,
+    reset: function () { cur = null; elByIdx = {}; rxns = {}; },
+    snapshot: function () {
+      var out = {};
+      Object.keys(rxns).forEach(function (k) {
+        out[k] = {};
+        Object.keys(rxns[k]).forEach(function (em) {
+          out[k][em] = Object.keys(rxns[k][em]).sort();
+        });
+      });
+      return { room: cur, rxns: out };
+    }
+  };
+})();
+
+// === feature: images ===
+// === feature: topics ===
+// Room topics. `TOPIC: <text>` sets the room topic banner; latest wins.
+// Empty text clears it. Processed from history (in order) on connect and
+// incrementally on poll.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.connect || !H.poll || !U.el || !U.esc) return;
+
+  var topic = null; // latest topic text for this room, null = never set
+
+  function ingest(text) {
+    try {
+      var m = String(text).match(/^topic:\s*([\s\S]*)$/i);
+      if (!m) return false;
+      topic = m[1]; // may be "" -> clears the banner
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function render() {
+    try {
+      var bar = U.el("topicbar");
+      if (!bar) return;
+      if (topic === null || topic === "") {
+        bar.hidden = true;
+        bar.innerHTML = "";
+      } else {
+        bar.hidden = false;
+        bar.innerHTML = '<span class="tlabel">topic</span>' + U.esc(topic);
+      }
+    } catch (e) { /* banner is decorative */ }
+  }
+
+  H.connect.push(function (ctx) {
+    try {
+      topic = null;
+      (ctx.history || []).forEach(function (m) { ingest(m.text); });
+      render();
+    } catch (e) {}
+  });
+
+  H.poll.push(function (ctx) {
+    try {
+      var changed = false;
+      ((ctx && ctx.fresh) || []).forEach(function (m) {
+        if (ingest(m.text)) changed = true;
+      });
+      if (changed) render();
+    } catch (e) {}
+  });
+
+  // Test seam.
+  try {
+    window.__topicsTest = {
+      ingest: ingest, render: render,
+      get: function () { return topic; },
+      set: function (t) { topic = t; }
+    };
+  } catch (e) {}
+})();
+
+// === feature: typing ===
+// Typing indicators. Senders publish `muse-bus:typing:<roomkey>:<nick>` keys
+// with a short TTL; this module lists them in #typingbar on connect + poll,
+// throttled to at most one fetch per 3s. Best-effort throughout.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.connect || !H.poll || !U.api || !U.busKey ||
+      !U.myNick || !U.el || !U.esc) return;
+
+  var lastFetch = 0;
+  var THROTTLE_MS = 3000;
+
+  function clear() {
+    try {
+      var bar = U.el("typingbar");
+      if (bar) bar.textContent = "";
+    } catch (e) {}
+  }
+
+  function render(nicks) {
+    try {
+      var bar = U.el("typingbar");
+      if (!bar) return;
+      if (!nicks || !nicks.length) { clear(); return; }
+      var extra = nicks.length - 3;
+      var shown = nicks.slice(0, 3).map(U.esc).join(", ");
+      if (extra > 0) shown += " and " + extra + " other" + (extra === 1 ? "" : "s");
+      shown += nicks.length === 1 ? " is typing…" : " are typing…";
+      bar.innerHTML = shown;
+    } catch (e) {}
+  }
+
+  function fetchTyping() {
+    var now = Date.now();
+    if (now - lastFetch < THROTTLE_MS) return; // at most one fetch per 3s
+    lastFetch = now;
+    var prefix;
+    try { prefix = "muse-bus:typing:" + U.busKey() + ":"; }
+    catch (e) { return; }
+    U.api("/keys/" + encodeURIComponent(prefix + "*")).then(function (res) {
+      var keys = (res && res.result) || [];
+      var me;
+      try { me = U.myNick(); } catch (e) { me = ""; }
+      var nicks = [];
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (typeof k !== "string" || k.indexOf(prefix) !== 0) continue;
+        var nick = k.slice(prefix.length);
+        if (!nick || nick === me) continue; // drop own nick
+        if (nicks.indexOf(nick) === -1) nicks.push(nick);
+      }
+      render(nicks);
+    }).catch(function () { clear(); }); // failure clears silently
+  }
+
+  H.connect.push(function () { try { fetchTyping(); } catch (e) {} });
+  H.poll.push(function () { try { fetchTyping(); } catch (e) {} });
+
+  // Test seam.
+  try {
+    window.__typingTest = {
+      fetchTyping: fetchTyping, render: render, clear: clear,
+      reset: function () { lastFetch = 0; }
+    };
+  } catch (e) {}
+})();
+
+// === feature: search ===
+// Client-side search over loaded history. Unhides #searchbar on connect;
+// on #q input (debounced 150ms) highlights matches with <mark> and shows
+// the hit count in #qcount. Messages are never hidden, so threads stay
+// intact. Each .msg keeps dataset.origHtml (captured lazily) for restore.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.connect || !H.poll || !U.el || !U.esc) return;
+
+  function escRe(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function msgEls() {
+    try {
+      return Array.prototype.slice.call(
+        document.querySelectorAll("#log .msg"));
+    } catch (e) { return []; }
+  }
+
+  function capture(el) {
+    try {
+      if (!("origHtml" in el.dataset)) el.dataset.origHtml = el.innerHTML;
+    } catch (e) {}
+  }
+
+  function setCount(n) {
+    try {
+      var c = U.el("qcount");
+      if (c) c.textContent = n ? n + (n === 1 ? " hit" : " hits") : "";
+    } catch (e) {}
+  }
+
+  function applyQuery(q) {
+    var list = msgEls();
+    if (!q) {
+      list.forEach(function (el) {
+        try {
+          if ("origHtml" in el.dataset) el.innerHTML = el.dataset.origHtml;
+        } catch (e) {}
+      });
+      setCount(0);
+      return;
+    }
+    var re;
+    try { re = new RegExp("(" + escRe(q) + ")", "gi"); }
+    catch (e) { setCount(0); return; }
+    var hits = 0;
+    list.forEach(function (el) {
+      capture(el);
+      var text;
+      try { text = el.textContent || ""; } catch (e) { text = ""; }
+      re.lastIndex = 0;
+      var m = text.match(re);
+      if (m) {
+        hits += m.length;
+        try {
+          el.innerHTML = U.esc(text).replace(
+            new RegExp("(" + escRe(q) + ")", "gi"), "<mark>$1</mark>");
+        } catch (e) {}
+      } else {
+        try { el.innerHTML = el.dataset.origHtml; } catch (e) {}
+      }
+    });
+    setCount(hits);
+  }
+
+  function currentQ() {
+    try {
+      var inp = U.el("q");
+      return inp ? inp.value : "";
+    } catch (e) { return ""; }
+  }
+
+  var debounce = null;
+  function onInput() {
+    try {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(function () { applyQuery(currentQ()); }, 150);
+    } catch (e) {}
+  }
+
+  H.connect.push(function () {
+    try {
+      var bar = U.el("searchbar");
+      if (bar) bar.hidden = false;
+      var inp = U.el("q");
+      if (inp && !inp.__searchBound) {
+        inp.__searchBound = true;
+        inp.addEventListener("input", onInput);
+      }
+      // Re-apply an active query to freshly rendered history.
+      var q = currentQ();
+      if (q) applyQuery(q);
+    } catch (e) {}
+  });
+
+  H.poll.push(function () {
+    try {
+      var q = currentQ();
+      if (q) applyQuery(q);
+    } catch (e) {}
+  });
+
+  // Test seam.
+  try {
+    window.__searchTest = {
+      applyQuery: applyQuery, escRe: escRe, capture: capture, msgEls: msgEls
+    };
+  } catch (e) {}
+})();
+
+// === feature: directory ===
+// === feature: directory ===
+// Room directory panel: lists rooms from the muse-bus:roomdir zset
+// (score = last-active unix ts), with per-room description from the
+// muse-bus:roominfo:<roomkey> hash and online count from the
+// muse-bus:presence:room:<roomkey>:* keys. Click a room to join it.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.connect || !H.poll || !U.panel || !U.api || !U.el || !U.reconnect) return;
+
+  var lastRefresh = 0;
+
+  // Parse ZRANGE ... WITHSCORES flat [member, score, ...] into
+  // [{key, ts}] sorted by ts descending.
+  function parseDir(result) {
+    var out = [];
+    if (!result || typeof result.length !== "number") return out;
+    for (var i = 0; i + 1 < result.length; i += 2) {
+      var key = result[i];
+      if (typeof key !== "string" || !key) continue;
+      var ts = parseFloat(result[i + 1]);
+      out.push({ key: key, ts: isNaN(ts) ? 0 : ts });
+    }
+    out.sort(function (a, b) { return b.ts - a.ts; });
+    return out;
+  }
+
+  // Parse HGETALL flat [field, value, ...] into {desc, last}.
+  function parseInfo(result) {
+    var info = { desc: "", last: "" };
+    if (!result || typeof result.length !== "number") return info;
+    for (var i = 0; i + 1 < result.length; i += 2) {
+      var v = result[i + 1];
+      if (result[i] === "desc") info.desc = v == null ? "" : String(v);
+      else if (result[i] === "last") info.last = v == null ? "" : String(v);
+    }
+    return info;
+  }
+
+  // Compact relative time: "5s", "3m", "2h", "4d"; "?" when unknown.
+  function relTime(ts, nowSec) {
+    if (!ts || ts <= 0) return "?";
+    var d = nowSec - ts;
+    if (d < 0) d = 0;
+    if (d < 60) return Math.floor(d) + "s";
+    if (d < 3600) return Math.floor(d / 60) + "m";
+    if (d < 86400) return Math.floor(d / 3600) + "h";
+    return Math.floor(d / 86400) + "d";
+  }
+
+  function displayName(rk) {
+    return rk === "muse-bus" ? "(main)" : String(rk).replace(/^muse-bus:room:/, "");
+  }
+
+  function inputValue(rk) {
+    return rk === "muse-bus" ? "" : String(rk).replace(/^muse-bus:room:/, "");
+  }
+
+  function joinRoom(rk) {
+    try {
+      var name = inputValue(rk);
+      var input = U.el("room");
+      if (input) input.value = name;
+      try { localStorage.setItem("relay-room", name); } catch (e) { /* private mode */ }
+      U.reconnect();
+    } catch (e) { /* never break the log */ }
+  }
+
+  async function roomDetail(rk) {
+    var desc = "", online = 0;
+    try {
+      var h = await U.api("/hgetall/muse-bus:roominfo:" + encodeURIComponent(rk));
+      desc = parseInfo(h && h.result).desc;
+    } catch (e) { /* best-effort */ }
+    try {
+      var k = await U.api("/keys/" + encodeURIComponent("muse-bus:presence:room:" + rk + ":*"));
+      if (k && k.result && typeof k.result.length === "number") online = k.result.length;
+    } catch (e) { /* best-effort */ }
+    return { desc: desc, online: online };
+  }
+
+  function appendRow(body, r, det) {
+    var row = document.createElement("div");
+    row.className = "drow";
+    var left = document.createElement("div");
+    var a = document.createElement("a");
+    a.href = "#";
+    a.textContent = displayName(r.key);
+    a.setAttribute("data-rk", r.key);
+    a.addEventListener("click", function (ev) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      joinRoom(r.key);
+    });
+    left.appendChild(a);
+    if (det.desc) {
+      var dd = document.createElement("div");
+      dd.className = "dmeta";
+      dd.textContent = det.desc;
+      left.appendChild(dd);
+    }
+    var meta = document.createElement("span");
+    meta.className = "dmeta";
+    meta.textContent = det.online + " online \u00b7 active " +
+      relTime(r.ts, Date.now() / 1000) + " ago";
+    row.appendChild(left);
+    row.appendChild(meta);
+    body.appendChild(row);
+  }
+
+  async function refresh(force) {
+    var now = Date.now();
+    if (!force && now - lastRefresh < 10000) return;
+    lastRefresh = now;
+    var body;
+    try { body = U.panel("directory", "\uD83D\uDCC1 Rooms"); } catch (e) { return; }
+    var rooms = [];
+    try {
+      var z = await U.api("/zrange/muse-bus:roomdir/0/-1/withscores");
+      rooms = parseDir(z && z.result);
+    } catch (e) { rooms = []; }
+    rooms = rooms.slice(0, 50);
+    try { body.innerHTML = ""; } catch (e) {}
+    if (!rooms.length) {
+      var empty = document.createElement("div");
+      empty.className = "drow";
+      var s = document.createElement("span");
+      s.className = "dmeta";
+      s.textContent = "no rooms yet";
+      empty.appendChild(s);
+      try { body.appendChild(empty); } catch (e) {}
+      return;
+    }
+    for (var i = 0; i < rooms.length; i++) {
+      var det = await roomDetail(rooms[i].key);
+      try { appendRow(body, rooms[i], det); } catch (e) { /* keep going */ }
+    }
+  }
+
+  H.connect.push(function () { refresh(false); });
+  H.poll.push(function () { refresh(false); });
+
+  window.__busTest = window.__busTest || {};
+  window.__busTest.dir = {
+    parseDir: parseDir, parseInfo: parseInfo, relTime: relTime,
+    displayName: displayName, inputValue: inputValue, refresh: refresh,
+    _reset: function () { lastRefresh = 0; }
+  };
+})();
+
+// === feature: mods ===
+// === feature: mods ===
+// Mod tools (read-only): shows the current room's mods and muted nicks from
+// muse-bus:mods:<roomkey> / muse-bus:muted:<roomkey>, and dims messages from
+// muted nicks (case-insensitive) via the .mutedmsg class. New arrivals are
+// dimmed by the message hook; history is dimmed by re-walking .msg elements
+// after the sets are fetched on connect.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H || !H.message || !H.connect || !H.poll || !U.panel || !U.api || !U.esc) return;
+
+  var modsList = [], mutedList = [];
+  var modsSet = {}, mutedSet = {};
+  var lastRefresh = 0;
+
+  function norm(n) { return String(n == null ? "" : n).toLowerCase(); }
+
+  function toList(arr) {
+    var out = [];
+    (arr || []).forEach(function (n) {
+      if (typeof n === "string" && n) out.push(n);
+    });
+    out.sort(function (a, b) {
+      var al = a.toLowerCase(), bl = b.toLowerCase();
+      return al < bl ? -1 : al > bl ? 1 : 0;
+    });
+    return out;
+  }
+
+  function isMuted(nick) { return !!mutedSet[norm(nick)]; }
+
+  function render() {
+    var body;
+    try { body = U.panel("mods", "\uD83D\uDEE1 Mods"); } catch (e) { return; }
+    var html =
+      '<div class="drow"><span>mods:</span><span class="dmeta">' +
+      (modsList.length ? U.esc(modsList.join(", ")) : "no mods") + "</span></div>" +
+      '<div class="drow"><span>muted:</span><span class="dmeta">' +
+      (mutedList.length ? U.esc(mutedList.join(", ")) : "none muted") + "</span></div>";
+    try { body.innerHTML = html; } catch (e) {}
+  }
+
+  // Re-apply dimming to message elements already in the log (backfill path:
+  // message hooks fired before the sets were fetched).
+  function rewalk() {
+    try {
+      var els = document.querySelectorAll(".msg");
+      for (var i = 0; i < els.length; i++) {
+        var n = els[i].querySelector(".nick");
+        var nick = n ? (n.textContent || "") : "";
+        if (isMuted(nick)) {
+          try { els[i].classList.add("mutedmsg"); } catch (e) {}
+        }
+      }
+    } catch (e) { /* best-effort */ }
+  }
+
+  async function refresh(force) {
+    var now = Date.now();
+    if (!force && now - lastRefresh < 10000) return false;
+    lastRefresh = now;
+    var rk;
+    try { rk = U.busKey(); } catch (e) { return false; }
+    var mods = [], muted = [];
+    try {
+      var a = await U.api("/smembers/muse-bus:mods:" + encodeURIComponent(rk));
+      mods = toList(a && a.result);
+    } catch (e) { /* best-effort */ }
+    try {
+      var b = await U.api("/smembers/muse-bus:muted:" + encodeURIComponent(rk));
+      muted = toList(b && b.result);
+    } catch (e) { /* best-effort */ }
+    modsList = mods; mutedList = muted;
+    modsSet = {}; mutedSet = {};
+    mods.forEach(function (n) { modsSet[norm(n)] = 1; });
+    muted.forEach(function (n) { mutedSet[norm(n)] = 1; });
+    render();
+    rewalk();
+    return true;
+  }
+
+  H.message.push(function (ctx) {
+    try {
+      if (ctx && ctx.el && isMuted(ctx.nick)) ctx.el.classList.add("mutedmsg");
+    } catch (e) { /* never break the log */ }
+  });
+  H.connect.push(function () { return refresh(false); });
+  H.poll.push(function () { refresh(false); });
+
+  window.__busTest = window.__busTest || {};
+  window.__busTest.mods = {
+    norm: norm, isMuted: isMuted, refresh: refresh, render: render,
+    rewalk: rewalk,
+    _lists: function () { return { mods: modsList.slice(), muted: mutedList.slice() }; },
+    _reset: function () { lastRefresh = 0; }
+  };
+})();
+
 // ================== END FEATURES ==================
 </script>
 </body>

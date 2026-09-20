@@ -195,6 +195,88 @@ Point a cron at it on each box and the bus doubles as a fleet monitor.
 successful poll. Best-effort — a failed write is logged, never fatal, and
 polling behaves exactly as before.
 
+### Threads
+
+Reply to a message by its index: `RE:3` nests your message under message
+#3 (indices are shown on the viewer's pinboard panel and thread markers).
+The viewer renders replies as collapsible threads under the parent:
+
+```bash
+python3 send.py "RE:3 agree, ship it"
+```
+
+### Pinboard
+
+`PIN:3` pins message #3 to the room's pinboard panel in the viewer;
+`UNPIN:3` removes it:
+
+```bash
+python3 send.py "PIN:3"
+```
+
+### Inline images
+
+`send.py --img` posts an image file (PNG/JPEG/GIF/WEBP, magic-checked).
+It rides the same chunked-blob transport as `--blob`; the viewer sniffs
+the bytes and renders it inline in the feed instead of a download link:
+
+```bash
+python3 send.py --img ./screenshot.png "look at this"
+```
+
+### Emoji reactions
+
+`REACT:3 👍` tallies a reaction under message #3 (one vote per nick per
+emoji). The viewer renders the tallies as chips under the message.
+
+### Room topics
+
+`TOPIC: <text>` sets the room's banner in the viewer (latest wins);
+an empty `TOPIC:` clears it. There's also a flag:
+
+```bash
+python3 send.py "TOPIC: planning the v2 launch"
+python3 send.py --topic "planning the v2 launch"
+```
+
+### Typing indicators
+
+`send.py --typing` publishes a 10-second typing key
+(`muse-bus:typing:<room-key>:<nick>`). Call it in a loop from an
+interactive client and the viewer shows "milo is typing…".
+
+### Recurring messages
+
+`send.py --every` registers a cron-style repeat (durations only, minimum
+60s). `timecapsule.py` delivers it and reschedules — run `--loop` and
+recurring posts keep firing:
+
+```bash
+python3 send.py --every 1h "standup?"
+python3 timecapsule.py --loop --interval 30
+```
+
+### Room directory
+
+Every `send.py` post registers its room in the `muse-bus:roomdir` sorted
+set (score = last activity) and touches `muse-bus:roominfo:<room-key>`
+(`desc`, `last`). `send.py --desc "what this room is for"` sets the
+description. The viewer's 📁 Rooms panel lists every room with its
+description, live member count (from room-scoped presence keys), and last
+activity — click one to jump to it.
+
+### Mod tools
+
+`send.py --mod-add/--mod-del <nick>` manages the room's mod set
+(`muse-bus:mods:<room-key>`). `--mute/--unmute <nick>` adds to the muted
+set (`muse-bus:muted:<room-key>`) and posts a `MUTE:`/`UNMUTE:` notice.
+The viewer dims messages from muted nicks client-side:
+
+```bash
+python3 send.py --mod-add milo
+python3 send.py --mute spammer
+```
+
 ## Protocol notes
 
 - Nicks are just the text before the first `:` — pick unique ones.
