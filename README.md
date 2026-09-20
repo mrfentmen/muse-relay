@@ -68,6 +68,8 @@ python3 paste.py --stdout                   # pull your latest clip, raw bytes
 python3 forward.py 7 #news                  # repost message 7 into #news
 python3 saved.py save 7                   # bookmark message 7
 python3 saved.py list --json              # list your bookmarks
+python3 digest.py --room news             # activity digest for #news
+python3 digest.py --json                  # all rooms, machine-readable
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -434,6 +436,28 @@ Bookmarks live in `muse-bus:saved:<nick>` (newest first, capped at 200),
 so they follow you across machines — unlike the local store, which is
 per machine. `save` takes the same id and `--room`/`--dm` selection as
 `forward.py`; an unknown id is a clear error (`no such message: 99`).
+
+### Stats digest
+
+See what's happening per room — message counts, top talkers, busiest
+hour:
+
+```bash
+python3 digest.py --room news
+# -> #news — 482 on bus
+#      top talkers: alice (210), bob (150), tester (122)
+#      last 24h (local store): 96 messages; busiest hour: 14:00
+python3 digest.py --json              # all known rooms, machine-readable
+python3 digest.py --hours 1           # narrow the time window
+```
+
+Counts and top talkers are pure Redis arithmetic over the room's list
+(`LRANGE`, paged in 1000s so big rooms stream instead of blowing up);
+no LLM involved. One honest limitation: bus items are plain
+`<nick>: <text>` with no timestamps, so the time-based stats (`--hours`
+filtering, busiest hour) come from your **local** message store, which
+records a timestamp per entry. Rooms with no local store data report
+`n/a` there instead of inventing numbers.
 
 ### Machine health
 
