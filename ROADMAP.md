@@ -45,19 +45,32 @@ Example: website job → worker 1 gets the web-designer skill, worker 2
 gets security, worker 3 gets coder, worker 4 is overseer making sure it
 all runs smooth. Not limited to websites — apps, games, anything code.
 
-### How it would work
+### How it would work (refined)
+
+No single machine runs 16 workers — a phone can't run an LLM and
+shouldn't have to. Each instance fans out **locally** on its own hardware
+with its own subagents; the bus is only the coordination layer.
 
 1. **Decompose.** The overseer breaks the build into work packages with
    clean interfaces (module boundaries, APIs, file ownership) *before*
    anyone writes code.
-2. **Dispatch.** Work packages go on the bus as jobs (see protocol
-   below). Workers claim them.
-3. **Build.** Each worker pulls the repo, branches, builds its package
-   against the interface contract, tests it, pushes.
-4. **Verify.** The overseer pulls each branch, runs the tests, checks the
+2. **Dispatch by DM.** The overseer holds the roster of worker nicks and
+   sends each work order as a DM, addressed by name:
+   `send.py --dm <shared-secret> "JOB:<id> <spec>"`. Specs stay out of
+   the groupchat noise.
+3. **Build locally.** Each worker claims the job on the groupchat
+   (`CLAIM:<id> by <nick>`), then uses its *own* local workers to build
+   the package against the interface contract, tests it, pushes.
+4. **Report to the groupchat.** Workers post `DONE:<id> <commit>` or
+   `BLOCKED:<id> <reason>` where everyone can see. Progress is public,
+   specs are private.
+5. **Verify.** The overseer pulls each branch, runs the tests, checks the
    contract — rejects or accepts.
-5. **Merge.** Overseer merges accepted branches, runs the full suite,
+6. **Merge.** Overseer merges accepted branches, runs the full suite,
    ships.
+
+The DM primitive already exists (`send.py --dm`, dead-drop rooms, and the
+viewer's DM panel) — no new transport needed.
 
 ### The missing primitive: a job protocol
 
@@ -107,10 +120,12 @@ already builds — coordinate workers, verify, integrate.
 
 ### Suggested pilot (don't build the factory first)
 
-1. Two workers + overseer, one small build (e.g. a single-page site).
-2. Overseer writes the interface contract up front, posts 2–3 jobs.
+1. One overseer, one worker instance, one small build (e.g. a
+   single-page site). The worker uses its own local subagents however it
+   likes.
+2. Overseer writes the interface contract up front, DMs 2–3 jobs.
 3. Run it, note every place it snags (it will snag).
-4. Only then decide whether the 4-role assembly line earns its keep.
+4. Only then decide whether the full assembly line earns its keep.
 
 If the pilot works, this probably deserves its own repo (the bus stays
 dumb transport; the crew is a system on top of it).
