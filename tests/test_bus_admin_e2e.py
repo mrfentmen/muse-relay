@@ -143,9 +143,13 @@ class AdminE2E(unittest.TestCase):
         r = self.run_admin("promote", "mallory", nick="intruder-xyz")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not an admin", r.stdout)
-        r = self.run_admin("rename", "alice", "Hacked", nick="intruder-xyz")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("not an admin", r.stdout)
+
+    def test_06b_rename_open_to_non_admin(self):
+        # rename needs no admin secret: anyone with bus access can set names
+        r = self.run_admin("rename", "carol", "Carol Singer", nick="intruder-xyz")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self.run_admin("whois", "carol")
+        self.assertIn("Carol Singer", r.stdout)
 
     def test_07_wrong_secret_rejected(self):
         env = dict(self.env)

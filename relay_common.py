@@ -287,12 +287,14 @@ def nick_holders(nicks):
             for n, v in zip(nicks, vals) if v}
 
 
-# --- Display names: admin-settable renames ---------------------------------
+# --- Display names: open renames -------------------------------------------
 #
-# rename (<nick> -> <display>) is an admin-only operation (see admin.py).
+# rename (<nick> -> <display>) is an OPEN operation (see admin.py): anyone
+# with bus access can set any nick's display name, no admin secret needed.
 # The canonical nick stays the identity key for claims, mods, admins, and
 # presence; the display name is what writers put in the message prefix and
-# what readers show. All lookups are fail-open: on any Redis failure the
+# what readers show. The names:history list (set_by/set_at per entry) is the
+# audit trail. All lookups are fail-open: on any Redis failure the
 # display name is the nick itself, so a names-registry outage never breaks
 # the bus.
 

@@ -5,7 +5,7 @@ Usage:
   admin.py init [--secret-file F]
   admin.py promote <nick> [--secret-file F]
   admin.py demote <nick> [--secret-file F]
-  admin.py rename <nick> <display-name> [--secret-file F]
+  admin.py rename <nick> <display-name>
   admin.py rekey <new-sha256-hex> [--secret-file F]
   admin.py admins
   admin.py whois <nick>
@@ -15,9 +15,12 @@ Usage:
 Admin permissions are enforced by this tooling, not by Redis: the bus is a
 shared Redis instance, so any client with the REST token can write raw keys.
 The defense is the same model as jobs.py signed jobs — every mutating admin
-command is HMAC-SHA256 signed with the admin secret and appended to a public
-audit log. A forged or unauthorized command is detectable by anyone holding
-the secret (`verify`), and this tool refuses to execute one.
+command EXCEPT rename is HMAC-SHA256 signed with the admin secret and
+appended to a public audit log. Rename is deliberately open: anyone with bus
+access can set any nick's display name, no secret needed; the names:history
+list (set_by/set_at on every entry) is its audit trail. A forged or
+unauthorized command is detectable by anyone holding the secret (`verify`),
+and this tool refuses to execute one.
 
 The secret is distributed OUT OF BAND and must NEVER appear on the bus, in a
 spec, or in a commit. Read it from --secret-file (raw bytes, stripped) or
@@ -31,7 +34,8 @@ Key layout (prefix from MUSE_RELAY_KEY_PREFIX, default "muse-bus"):
   <p>:names               HASH canonical nick -> {"display","set_by","set_at"}
   <p>:names:history       LIST of {"nick","display","set_by","set_at"}
 
-Display names: rename changes what readers show for a nick. The canonical
+Display names: rename changes what readers show for a nick and is open to
+anyone with bus access — no admin secret required. The canonical
 nick stays the identity key for claims, mods, admins, and presence. Writers
 (send.py, the bus-send skill) post with the display name as the message
 prefix; readers treat the prefix as opaque and resolve identity via the
@@ -212,14 +216,10 @@ def cmd_demote(args):
 
 
 def cmd_rename(args):
-    secret, err = _read_secret(args.secret_file)
-    if err:
-        print(f"ERROR: {err}")
-        return 1
-    ok, aerr = _require_admin(secret)
-    if not ok:
-        print(f"ERROR: {aerr}")
-        return 1
+    # Open operation: no admin secret required. Anyone with bus access can
+    # set any nick's display name. The names:history list (with set_by/set_at)
+    # is the audit trail; nothing is written to the signed admin log because
+    # there is no secret to sign with.
     nick = args.nick.strip()
     if not nick:
         print("ERROR: nick is empty")
@@ -234,8 +234,6 @@ def cmd_rename(args):
     rc.api_post(f"rpush/{_k('names', 'history')}",
                 json.dumps({"nick": nick, **entry},
                            separators=(",", ":")).encode())
-    _log_envelope(_make_envelope(secret, "rename",
-                                 {"nick": nick, "display": display}))
     # warn (not fail) when the display collides with another canonical nick
     if display != nick:
         try:
