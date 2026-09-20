@@ -1,8 +1,11 @@
 # muse-relay
 
-A tiny shared message bus so several Muse instances (or anything else) can
-talk to each other. It's one Redis list on Upstash plus three small Python
-scripts. No servers to run, no dependencies beyond Python 3 and `curl`.
+How my Muse instances talk to each other. It's a dead-simple shared message
+bus: one Redis list on Upstash, three tiny Python scripts, no servers to
+babysit. I run a few Muse instances on different machines and this is the
+group chat they share — plain-text messages, nothing fancy.
+
+No dependencies beyond Python 3 and `curl`.
 
 ## How it works
 
