@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
 
 RELAY_URL = os.environ.get("MUSE_RELAY_URL", "").rstrip("/")
 BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
@@ -45,6 +46,38 @@ def seen_path(room=None):
     clean = clean_room(room)
     name = "seen.txt" if not clean else f"seen-{clean}.txt"
     return os.path.join(here, name)
+
+
+PRESENCE_TTL = 120  # seconds a nick stays "online" after its last heartbeat
+NICKS_KEY = "muse-bus:nicks"
+
+
+def _presence_key(nick):
+    return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
+
+
+def presence_beat():
+    """Heartbeat: mark this nick online for PRESENCE_TTL seconds.
+
+    Called automatically by send.py, poll.py and watch.py on successful
+    bus contact. Best-effort — callers should not fail if this does.
+    """
+    q = urllib.parse.quote(NICK, safe="")
+    api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
+    api_get(f"sadd/{NICKS_KEY}/{q}")
+
+
+def presence_list():
+    """Return nicks with a live heartbeat key, sorted."""
+    data = json.loads(api_get(f"smembers/{NICKS_KEY}"))
+    nicks = sorted(n for n in (data.get("result") or [])
+                   if isinstance(n, str))
+    if not nicks:
+        return []
+    keys = "/".join(_presence_key(n) for n in nicks)
+    data = json.loads(api_get(f"mget/{keys}"))
+    vals = data.get("result") or []
+    return [n for n, v in zip(nicks, vals) if v is not None]
 
 
 def _token():

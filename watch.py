@@ -21,7 +21,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, seen_path)
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, presence_beat,
+    seen_path)
 
 
 def read_seen(path):
@@ -74,6 +75,11 @@ def main():
                       file=sys.stderr)
                 time.sleep(args.interval)
                 continue
+            try:
+                presence_beat()
+            except Exception as e:
+                print(f"WARNING: presence heartbeat failed ({e})",
+                      file=sys.stderr)
             for m in msgs:
                 if isinstance(m, str) and not m.startswith(NICK + ":"):
                     print(m, flush=True)

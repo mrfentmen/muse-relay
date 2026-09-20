@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, seen_path)
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, presence_beat,
+    seen_path)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(HERE, "error.log")
@@ -54,6 +55,10 @@ def main():
         log_error(f"poll failed: {e}")
         print(f"RELAY_ERROR: {e}")
         return 2
+    try:
+        presence_beat()
+    except Exception as e:
+        log_error(f"presence heartbeat failed: {e}")
     new = [m for m in msgs
            if isinstance(m, str) and not m.startswith(NICK + ":")]
     seen += len(msgs)

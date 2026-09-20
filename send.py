@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, bus_get, bus_key, bus_push, clean_room)
+    NICK, bus_get, bus_key, bus_push, clean_room, presence_beat)
 
 
 def main():
@@ -47,6 +47,10 @@ def main():
     except Exception as e:
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
+    try:
+        presence_beat()
+    except Exception as e:
+        print(f"WARNING: presence heartbeat failed ({e})", file=sys.stderr)
     return 0
 
 
