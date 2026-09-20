@@ -242,6 +242,59 @@ class AdminE2E(unittest.TestCase):
                            capture_output=True, text=True, timeout=60)
         self.assertIn("cleaned", r.stdout)
 
+    def test_11_rekey(self):
+        import hashlib
+        new_secret = secrets.token_bytes(32)
+        digest = hashlib.sha256(new_secret).hexdigest()
+        new_secret_file = os.path.join(self.tmp, "admin_secret_new")
+        with open(new_secret_file, "wb") as f:
+            f.write(new_secret)
+        os.chmod(new_secret_file, 0o600)
+        self.addCleanup(lambda: os.path.exists(new_secret_file)
+                        and os.unlink(new_secret_file))
+        # rotate with the CURRENT (old) secret
+        r = self.run_admin("rekey", digest)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OK admin secret rotated", r.stdout)
+        # old secret is now rejected
+        r = self.run_admin("promote", "mallory")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("secret does not match", r.stdout)
+        # new secret works for a mutating command
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO, "admin.py"),
+             "--secret-file", new_secret_file, "promote", "rekeyed-admin"],
+            capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OK 'rekeyed-admin' promoted", r.stdout)
+        # verify with the NEW secret: post-rekey entries check out, the
+        # pre-rekey ones are reported sealed (not failures)
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO, "admin.py"),
+             "--secret-file", new_secret_file, "verify"],
+            capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("VERIFY OK", r.stdout)
+        self.assertIn("sealed under a previous secret", r.stdout)
+        # a forged entry AFTER the rekey is still detected with the new secret
+        code = (
+            "import sys, json; sys.path.insert(0, %r);"
+            "import relay_common as rc;"
+            "env={'v':1,'cmd':'promote','args':{'nick':'mallory'},"
+            "'actor':'%s','ts':1,'nonce':'00','sig':'forged'};"
+            "rc.api_post('rpush/%s:admin:log', json.dumps(env).encode());"
+            "print('forged')"
+        ) % (REPO, BOSS, PREFIX)
+        r = subprocess.run([sys.executable, "-c", code], env=self.env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertIn("forged", r.stdout)
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO, "admin.py"),
+             "--secret-file", new_secret_file, "verify"],
+            capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("VERIFY FAIL", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

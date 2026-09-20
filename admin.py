@@ -6,6 +6,7 @@ Usage:
   admin.py promote <nick> [--secret-file F]
   admin.py demote <nick> [--secret-file F]
   admin.py rename <nick> <display-name> [--secret-file F]
+  admin.py rekey <new-sha256-hex> [--secret-file F]
   admin.py admins
   admin.py whois <nick>
   admin.py log [n]
@@ -281,6 +282,28 @@ def cmd_whois(args):
     return 0
 
 
+def cmd_rekey(args):
+    """Rotate the admin secret. Authenticated with the CURRENT secret; the
+    new secret itself never appears here — only its sha256 hex digest, which
+    is safe to pass around (it is what Redis stores)."""
+    secret, err = _read_secret(args.secret_file)
+    if err:
+        print(f"ERROR: {err}")
+        return 1
+    ok, aerr = _require_admin(secret)
+    if not ok:
+        print(f"ERROR: {aerr}")
+        return 1
+    digest = args.new_sha256.strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        print("ERROR: new-sha256 must be 64 hex chars (sha256 of the new secret)")
+        return 1
+    _log_envelope(_make_envelope(secret, "rekey", {"new_sha256": digest}))
+    rc.api_get(f"set/{_k('admin', 'secret_sha256')}/{digest}")
+    print("OK admin secret rotated; rekey logged in the audit trail")
+    return 0
+
+
 def cmd_log(args):
     n = args.n if args.n else 10
     try:
@@ -307,13 +330,26 @@ def cmd_verify(args):
     except Exception as e:
         print(f"ERROR: log read failed: {e}")
         return 1
-    bad = [i for i, e in enumerate(entries)
+    # A rekey rotates the secret, so entries at or before the last rekey
+    # marker were signed with a previous secret and cannot be checked with
+    # the current one — they are reported as sealed, not as failures. Every
+    # entry AFTER the marker must verify, otherwise the log is compromised.
+    # (A forged marker cannot hide forged entries: they would land after it
+    # and fail verification.)
+    marker = max([i for i, e in enumerate(entries)
+                  if e.get("cmd") == "rekey"], default=-1)
+    sealed = entries[:marker + 1]
+    live = entries[marker + 1:]
+    bad = [i for i, e in enumerate(live, start=marker + 1)
            if not _verify_envelope(secret, e)]
     if bad:
-        print(f"VERIFY FAIL: {len(bad)} of {len(entries)} log entries have "
-              f"BAD signatures (indexes {bad})")
+        print(f"VERIFY FAIL: {len(bad)} of {len(live)} post-rekey log "
+              f"entries have BAD signatures (indexes {bad})")
         return 1
-    print(f"VERIFY OK: {len(entries)} log entries, all signatures valid")
+    sealed_note = (f" ({len(sealed)} sealed under a previous secret)"
+                   if sealed else "")
+    print(f"VERIFY OK: {len(live)} entries checked, all signatures "
+          f"valid{sealed_note}")
     return 0
 
 
@@ -331,6 +367,9 @@ def main(argv=None):
     p = sub.add_parser("rename", help="set a nick's display name")
     p.add_argument("nick")
     p.add_argument("display")
+    p = sub.add_parser("rekey", help="rotate the admin secret "
+                       "(takes the sha256 hex of the NEW secret)")
+    p.add_argument("new_sha256")
     sub.add_parser("admins", help="list admins")
     p = sub.add_parser("whois", help="show a nick's display name + history")
     p.add_argument("nick")
@@ -342,6 +381,7 @@ def main(argv=None):
     try:
         return {"init": cmd_init, "promote": cmd_promote,
                 "demote": cmd_demote, "rename": cmd_rename,
+                "rekey": cmd_rekey,
                 "admins": cmd_admins, "whois": cmd_whois,
                 "log": cmd_log, "verify": cmd_verify}[args.cmd](args)
     except RuntimeError as e:
