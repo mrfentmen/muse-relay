@@ -288,13 +288,14 @@ def cmd_claim(args):
             "claimed_at": now, "lease_until": now + lease, "lease": lease,
         })
     except Exception as e:
-        print(f"RELAY_ERROR: claim record failed ({e})", file=sys.stderr)
         # Roll back the mutex so the job stays open and claimable instead
         # of claimed-but-unworkable until the lease expires.
+        # Best-effort: never mask the original error.
         try:
             api_get(f"del/{_claim_key(args.id)}")
         except Exception:
             pass
+        print(f"RELAY_ERROR: claim record failed ({e})", file=sys.stderr)
         return 2
     w = _creator_warning(h)
     if w:

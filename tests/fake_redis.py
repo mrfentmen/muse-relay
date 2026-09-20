@@ -145,10 +145,16 @@ class FakeUpstash:
             z = self.zsets.setdefault(a[0], {})
             z[a[2]] = float(a[1])
             return 1
+        if cmd == "zrem":
+            z = self.zsets.get(a[0], {})
+            removed = sum(1 for m in a[1:] if z.pop(m, None) is not None)
+            return removed
         if cmd == "zrange":
             z = self.zsets.get(a[0], {})
             ordered = sorted(z, key=lambda m: (z[m], m))
             return ordered
+        if cmd == "ping":
+            return "PONG"
         raise ValueError(f"fake: unknown command {cmd}")
 
     # -- api_post / bus_push -------------------------------------------

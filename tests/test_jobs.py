@@ -264,5 +264,24 @@ class EncodingTest(RelayTestCase):
         self.assertEqual(h["note"], val)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class ClaimRollbackTest(RelayTestCase):
+    def test_claim_mutex_rolled_back_when_hset_fails(self):
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        orig_hset = jobs._hset
+
+        def boom(key, mapping):
+            raise RuntimeError("injected hset failure")
+
+        jobs._hset = boom
+        try:
+            rc, out, err = self.run_cli(jobs.main, ["claim", "1"])
+        finally:
+            jobs._hset = orig_hset
+        self.assertNotEqual(rc, 0)
+        # mutex key must be gone so the job doesn't look claimed-but-unworkable
+        self.assertNotIn(jobs._claim_key("1"), self.fake.strings)
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["status"], "open")
+
+
+if __name__ == "__main__":    unittest.main()
