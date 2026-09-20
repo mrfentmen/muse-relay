@@ -43,7 +43,6 @@ Idempotent: skips the send if the identical message is already at the tail.
 Never prints the token.
 """
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -55,8 +54,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, api_get, blob_expire, blob_put, bus_get, bus_key, bus_push,
-    bus_trim, clean_room, img_put, mod_add, mod_del, mute_add, mute_del,
-    presence_beat, recur_add, room_set_desc, room_touch, typing_ping)
+    bus_trim, clean_room, dm_room, img_put, mod_add, mod_del, mute_add,
+    mute_del, nick_conflict_holder, presence_beat, recur_add, room_set_desc,
+    room_touch, typing_ping)
 
 TIMECAPSULE_KEY = "muse-bus:timecapsule"
 
@@ -104,14 +104,19 @@ def parse_ttl(spec):
             f"--ttl needs a duration (30s, 10m, 2h, 1d), got {spec!r}")
 
 
-def dm_room(secret):
-    """Dead-drop room name derived from a shared secret."""
-    return "dm-" + hashlib.sha1(secret.encode()).hexdigest()[:12]
-
-
 def sanitize_basename(name):
     base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(name).strip())
     return (base or "blob")[:60]
+
+
+def warn_nick_conflict():
+    """Warn when another instance holds the claim on our nick."""
+    holder = nick_conflict_holder()
+    if holder:
+        print(f"WARNING: nick '{NICK}' is claimed by instance '{holder}' — "
+              f"your messages may be confused with theirs. Set "
+              f"MUSE_RELAY_INSTANCE_ID uniquely or pick another nick.",
+              file=sys.stderr)
 
 
 def read_blob_source(path):
@@ -154,6 +159,7 @@ def send_ephemeral(ttl_secs, key, text):
         presence_beat(key)
     except Exception as e:
         print(f"WARNING: presence heartbeat failed ({e})", file=sys.stderr)
+    warn_nick_conflict()
     try:
         room_touch(key)
     except Exception as e:
@@ -186,6 +192,7 @@ def post_message(text, key):
         presence_beat(key)
     except Exception as e:
         print(f"WARNING: presence heartbeat failed ({e})", file=sys.stderr)
+    warn_nick_conflict()
     try:
         room_touch(key)
     except Exception as e:

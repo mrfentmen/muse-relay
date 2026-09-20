@@ -14,6 +14,7 @@ chmod 600. The token is never printed by any script.
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 import urllib.parse
@@ -42,6 +43,11 @@ def bus_key(room=None):
     return f"muse-bus:room:{clean}" if clean else BUS
 
 
+def dm_room(secret):
+    """Dead-drop room name derived from a shared secret."""
+    return "dm-" + hashlib.sha1(secret.encode()).hexdigest()[:12]
+
+
 def seen_path(room=None):
     """Read-offset file for a room, next to this module."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -66,8 +72,8 @@ def presence_beat(roomkey=None):
 
     Called automatically by send.py, poll.py and watch.py on successful
     bus contact. When roomkey is given, also marks the nick present in
-    that specific room. Best-effort — callers should not fail if this
-    does.
+    that specific room. Also renews this instance's nick claim (see
+    nick_claim). Best-effort — callers should not fail if this does.
     """
     q = urllib.parse.quote(NICK, safe="")
     api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
@@ -75,6 +81,10 @@ def presence_beat(roomkey=None):
     if roomkey:
         api_get(f"setex/muse-bus:presence:room:{roomkey}:{q}/"
                 f"{PRESENCE_TTL}/1")
+    try:
+        nick_claim()
+    except Exception:
+        pass
 
 
 def presence_list():
@@ -88,6 +98,95 @@ def presence_list():
     data = json.loads(api_get(f"mget/{keys}"))
     vals = data.get("result") or []
     return [n for n, v in zip(nicks, vals) if v is not None]
+
+
+# --- Nick claims: first-come nick reservation ---------------------------
+#
+# Bus nicks are otherwise unauthenticated: anyone can post as any nick.
+# A nick claim is a lightweight defense: the first instance to use a nick
+# records its instance id at muse-bus:nickclaim:<nick> (SET NX, 5-minute
+# TTL, renewed by every presence_beat). A second instance using the same
+# nick sees the conflict via nick_conflict_holder() and warns instead of
+# silently sharing the identity.
+#
+# INSTANCE_ID defaults to the machine hostname, so one agent per machine
+# just works. Running two agents as the same nick on ONE machine needs
+# MUSE_RELAY_INSTANCE_ID set differently per agent.
+
+INSTANCE_ID = os.environ.get("MUSE_RELAY_INSTANCE_ID") or socket.gethostname()
+NICKCLAIM_TTL = 300  # seconds; renewed by presence_beat
+_CLAIM_CHECK_INTERVAL = 60  # seconds between claim checks
+_claim_state = {"checked": 0.0, "ok": None, "holder": None}
+
+
+def _nickclaim_key(nick=None):
+    return "muse-bus:nickclaim:" + urllib.parse.quote(nick or NICK, safe="")
+
+
+def nick_holder(nick):
+    """Return the instance id currently holding nick's claim, or None.
+
+    Read-only; never creates or renews a claim. Returns None when the
+    nick is unclaimed or the lookup fails.
+    """
+    try:
+        cur = json.loads(api_get(f"get/{_nickclaim_key(nick)}"))["result"]
+    except Exception:
+        return None
+    if not cur:
+        return None
+    return urllib.parse.unquote(cur)
+
+
+def nick_claim(force=False):
+    """Claim (or renew) this instance's reservation of NICK.
+
+    First caller wins via SET NX; the winner renews the TTL on every
+    check. Returns (True, holder) when we hold the claim, (False, holder)
+    on conflict, (None, None) when the check itself failed (stay quiet).
+    Checked at most once per _CLAIM_CHECK_INTERVAL unless forced.
+    Raises on transport failure only when force=True and the check runs.
+    """
+    now = time.time()
+    st = _claim_state
+    # Cache wins, but never cache a conflict: re-check every time so we
+    # notice the moment the other holder goes away.
+    if not force and st["ok"] and now - st["checked"] < _CLAIM_CHECK_INTERVAL:
+        return True, st["holder"]
+    key = _nickclaim_key()
+    me = urllib.parse.quote(INSTANCE_ID, safe="")
+    try:
+        cur = json.loads(api_get(f"get/{key}"))["result"]
+        if cur is None:
+            r = json.loads(
+                api_get(f"set/{key}/{me}/NX/EX/{NICKCLAIM_TTL}"))["result"]
+            if r == "OK":
+                ok, holder = True, INSTANCE_ID
+            else:  # lost the race; whoever won is the holder
+                cur = json.loads(api_get(f"get/{key}"))["result"] or ""
+                ok = cur == me
+                holder = urllib.parse.unquote(cur) if cur else "?"
+        elif cur == me:
+            api_get(f"expire/{key}/{NICKCLAIM_TTL}")
+            ok, holder = True, INSTANCE_ID
+        else:
+            ok, holder = False, urllib.parse.unquote(cur)
+    except Exception:
+        if force:
+            raise
+        return None, None
+    st["checked"] = now
+    st["ok"] = ok
+    st["holder"] = holder
+    return ok, holder
+
+
+def nick_conflict_holder():
+    """Instance id holding our nick's claim when WE lost it, else None."""
+    ok, holder = _claim_state["ok"], _claim_state["holder"]
+    if ok is False:
+        return holder
+    return None
 
 
 def _token():
@@ -174,6 +273,38 @@ def bus_push(body, key=None):
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
         time.sleep(2)
     raise RuntimeError(f"push failed after 4 attempts: {last_err}")
+
+
+def api_post(path, body):
+    """POST a raw body to <RELAY_URL>/<path>; returns the raw response.
+
+    Same curl transport as bus_push. Used for values too big or awkward
+    for a URL path segment (job specs, long text).
+    """
+    _check_config()
+    token = _token()
+    cmd = ["curl", "-s", "-m", "20",
+           "-H", f"Authorization: Bearer {token}",
+           "-H", "Content-Type: text/plain",
+           "-H", "Connection: close",
+           "--data-binary", "@-",
+           f"{RELAY_URL}/{path}"]
+    data = body.encode("utf-8") if isinstance(body, str) else body
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(cmd, input=data, capture_output=True,
+                               timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.decode("utf-8", "replace")
+        last_err = (p.stderr.decode("utf-8", "replace").strip()
+                    or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"post failed after 4 attempts: {last_err}")
 
 
 def mark_seen(key, nick, offset):

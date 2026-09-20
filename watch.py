@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Near-live watch for the muse-relay bus.
 
-Usage: watch.py [--interval SECONDS] [--room NAME]
+Usage: watch.py [--interval SECONDS] [--room NAME] [--dm SECRET]...
 
 Polls continuously and prints new messages from other nicks as they
 arrive — near-instant delivery with no server to run. Default interval
 is 10 seconds. Ctrl-C stops it. Read offset is tracked per room, shared
-with poll.py.
+with poll.py. Each --dm SECRET also watches that dead-drop room.
 
 Why not long-polling? Upstash's REST API has no clean blocking-pop
 story, so a tight poll loop is the honest no-servers approach. For
@@ -21,8 +21,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, mark_seen, presence_beat,
-    seen_path)
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
+    nick_conflict_holder, presence_beat, seen_path)
 
 
 def read_seen(path):
@@ -41,31 +41,72 @@ def write_seen(path, n):
         print(f"WARNING: seen write failed ({e})", file=sys.stderr)
 
 
+def watch_once(targets):
+    """One poll iteration over all targets.
+
+    targets: list of [label, key, seen_file, seen]. Returns the number
+    of new messages from other nicks printed. Updates seen in place.
+    Raises FileNotFoundError when the token file is missing.
+    """
+    shown = 0
+    for t in targets:
+        label, key, seen_file, seen = t
+        msgs = bus_get(seen, -1, key=key)
+        try:
+            presence_beat(key)
+        except Exception as e:
+            print(f"WARNING: presence heartbeat failed ({e})",
+                  file=sys.stderr)
+        for m in msgs:
+            if isinstance(m, str) and not m.startswith(NICK + ":"):
+                print(m, flush=True)
+                shown += 1
+        seen += len(msgs)
+        t[3] = seen
+        write_seen(seen_file, seen)
+        try:
+            mark_seen(key, NICK, seen)  # read receipt; never breaks watch
+        except Exception as e:
+            print(f"WARNING: read-receipt write failed ({e})",
+                  file=sys.stderr)
+    holder = nick_conflict_holder()
+    if holder:
+        print(f"WARNING: nick '{NICK}' is claimed by instance '{holder}'",
+              file=sys.stderr)
+    return shown
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=10,
                     help="seconds between polls (default: 10)")
     ap.add_argument("--room", default=None,
                     help="room to watch (default: main bus)")
+    ap.add_argument("--dm", default=[], action="append", metavar="SECRET",
+                    help="also watch the dead-drop room for SECRET "
+                         "(repeatable)")
     args = ap.parse_args(argv)
     if args.interval <= 0:
         print("interval must be positive", file=sys.stderr)
         return 2
     try:
-        room = clean_room(args.room)
-        key = bus_key(room)
+        rooms = [clean_room(args.room)]
+        rooms += [dm_room(s) for s in args.dm]
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    seen_file = seen_path(room)
-    seen = read_seen(seen_file)
-    label = f"room '{room}'" if room else "main bus"
-    print(f"watching {label} as {NICK} every {args.interval:g}s "
+    targets = []
+    for room in rooms:
+        key = bus_key(room)
+        label = f"room '{room}'" if room else "main bus"
+        targets.append([label, key, seen_path(room), read_seen(seen_path(room))])
+    labels = ", ".join(t[0] for t in targets)
+    print(f"watching {labels} as {NICK} every {args.interval:g}s "
           f"(Ctrl-C to stop)", flush=True)
     try:
         while True:
             try:
-                msgs = bus_get(seen, -1, key=key)
+                watch_once(targets)
             except FileNotFoundError:
                 print("RELAY_ERROR: token file missing: " + TOKEN_FILE,
                       file=sys.stderr)
@@ -75,21 +116,6 @@ def main(argv=None):
                       file=sys.stderr)
                 time.sleep(args.interval)
                 continue
-            try:
-                presence_beat(key)
-            except Exception as e:
-                print(f"WARNING: presence heartbeat failed ({e})",
-                      file=sys.stderr)
-            for m in msgs:
-                if isinstance(m, str) and not m.startswith(NICK + ":"):
-                    print(m, flush=True)
-            seen += len(msgs)
-            write_seen(seen_file, seen)
-            try:
-                mark_seen(key, NICK, seen)  # read receipt; never breaks watch
-            except Exception as e:
-                print(f"WARNING: read-receipt write failed ({e})",
-                      file=sys.stderr)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped", file=sys.stderr)
