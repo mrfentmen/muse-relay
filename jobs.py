@@ -18,6 +18,17 @@ Usage:
   jobs.py blocked <id> --reason TEXT [--room R]
   jobs.py requeue <id> [--room R]
   jobs.py sweep [--room R]
+  jobs.py verify <id> --secret-file PATH
+
+Signed jobs (defense against spoofed overseers):
+  jobs.py post ... --secret-file ~/.config/muse-relay/job-secret
+  jobs.py claim <id> --secret-file ~/.config/muse-relay/job-secret
+
+  The secret is a shared per-crew value distributed OUT OF BAND (your user
+  tells both sides; never post it to the bus). post stores an HMAC-SHA256
+  over the canonical job content; verify recomputes it; claim with
+  --secret-file refuses to claim a job whose signature is BAD. The secret
+  file is read as bytes (trailing whitespace stripped) and never printed.
 
 Keys (MUSE_RELAY_JOBNS overrides the muse-bus:job prefix):
   <ns>seq            INCR job counter
@@ -36,6 +47,8 @@ announcements; the Redis state is the source of truth.
 Never prints the token.
 """
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -102,6 +115,65 @@ def _hdel(key, *fields):
 
 def _valid_id(jid):
     return jid.isdigit() and int(jid) > 0
+
+
+# --- Signed jobs: HMAC-SHA256 over canonical job content -------------------
+#
+# Bus nicks are unauthenticated, so anyone can post JOB: as the overseer.
+# A worker that executes a spoofed spec hands RCE to the spoofer. Signing
+# closes that hole for crews that share a secret: the overseer signs at
+# post time, the worker verifies before claiming.
+#
+# The secret is distributed OUT OF BAND — the user tells both sides
+# directly (a file both machines already have, a DM on another channel,
+# etc.). It must NEVER appear on the bus, in a spec, or in a commit.
+# The file holds the raw secret bytes; trailing whitespace is stripped.
+
+def _read_secret(path):
+    """Read the shared crew secret. Returns (bytes, None) or (None, err)."""
+    try:
+        with open(os.path.expanduser(path), "rb") as f:
+            secret = f.read().strip()
+    except OSError as e:
+        return None, f"cannot read secret file {path!r}: {e}"
+    if not secret:
+        return None, f"secret file {path!r} is empty"
+    return secret, None
+
+
+def _canonical_payload(fields, spec):
+    """Deterministic bytes of exactly what the signature covers."""
+    payload = {
+        "title": fields.get("title", ""),
+        "spec": spec,
+        "accept": fields.get("accept", ""),
+        "branch": fields.get("branch", ""),
+        "base": fields.get("base", ""),
+        "room": fields.get("room", ""),
+    }
+    return json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _sign_job(secret, fields, spec):
+    return hmac.new(secret, _canonical_payload(fields, spec),
+                    hashlib.sha256).hexdigest()
+
+
+def verify_job(jid, secret):
+    """Check a job's signature. Returns one of 'OK', 'BAD', 'UNSIGNED'.
+
+    Raises ValueError for unknown job ids; other exceptions are transport
+    failures from the state reads.
+    """
+    h, spec = job_get(jid)
+    if h is None:
+        raise ValueError(f"no such job: {jid}")
+    sig = h.get("sig")
+    if not sig:
+        return "UNSIGNED"
+    good = hmac.compare_digest(_sign_job(secret, h, spec or ""), sig)
+    return "OK" if good else "BAD"
 
 
 def job_get(jid):
@@ -188,17 +260,32 @@ def cmd_post(args):
     try:
         jid = str(json.loads(api_get(f"incr/{_seq_key()}"))["result"])
         now = int(time.time())
-        _hset(_job_key(jid), {
+        fields = {
             "title": args.title, "room": room, "branch": args.branch,
             "base": args.base, "accept": args.accept, "status": "open",
             "lease": lease, "created_by": NICK, "created_host": INSTANCE_ID,
             "created_at": now,
-        })
+        }
+        _hset(_job_key(jid), fields)
         api_post(f"set/{_spec_key(jid)}", spec)
         api_get(f"zadd/{_index_key()}/{now}/{jid}")
     except Exception as e:
         print(f"RELAY_ERROR: post failed ({e})", file=sys.stderr)
         return 2
+    if args.secret_file:
+        secret, serr = _read_secret(args.secret_file)
+        if serr:
+            print(f"ERROR: {serr}", file=sys.stderr)
+            return 2
+        try:
+            _hset(_job_key(jid), {
+                "sig": _sign_job(secret, fields, spec),
+                "signed_by": NICK,
+            })
+        except Exception as e:
+            print(f"RELAY_ERROR: signing failed ({e})", file=sys.stderr)
+            return 2
+        print(f"SIGNED {jid}", file=sys.stderr)
     _announce(room, f"JOB:{jid} {args.title}")
     print(f"JOB {jid}")
     return 0
@@ -236,7 +323,7 @@ def cmd_show(args):
     for f in ("title", "status", "room", "branch", "base", "accept",
               "claim", "claim_host", "claimed_at", "lease_until",
               "result_commit", "note", "created_by", "created_host",
-              "created_at", "lease"):
+              "created_at", "lease", "signed_by"):
         if h.get(f):
             print(f"{f}: {h[f]}")
     w = _creator_warning(h)
@@ -260,6 +347,22 @@ def cmd_claim(args):
     if h is None:
         print(f"ERROR: no such job: {args.id}", file=sys.stderr)
         return 2
+    if args.secret_file and h.get("sig"):
+        secret, serr = _read_secret(args.secret_file)
+        if serr:
+            print(f"ERROR: {serr}", file=sys.stderr)
+            return 2
+        try:
+            verdict = verify_job(args.id, secret)
+        except Exception as e:
+            print(f"RELAY_ERROR: verify failed ({e})", file=sys.stderr)
+            return 2
+        if verdict == "BAD":
+            print(f"ERROR: job {args.id} signature BAD — spec or fields "
+                  f"were tampered with; not claiming", file=sys.stderr)
+            return 1
+        # OK: fall through and claim. (Unsigned jobs have no sig to check;
+        # the worker chose to verify, so an unsigned job is claimed as-is.)
     h = _claim_or_requeue(args.id, h)
     if h.get("status") != "open":
         print(f"ERROR: job {args.id} is {h.get('status')}"
@@ -303,6 +406,23 @@ def cmd_claim(args):
     _announce(args.room or h.get("room") or "", f"CLAIM:{args.id} by {NICK}")
     print(f"CLAIMED {args.id} by {NICK}")
     return 0
+
+
+def cmd_verify(args):
+    secret, serr = _read_secret(args.secret_file)
+    if serr:
+        print(f"ERROR: {serr}", file=sys.stderr)
+        return 2
+    try:
+        verdict = verify_job(args.id, secret)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"RELAY_ERROR: verify failed ({e})", file=sys.stderr)
+        return 2
+    print(verdict)
+    return 0 if verdict == "OK" else 1
 
 
 def _renew_lease(jid, h, lease):
@@ -460,6 +580,8 @@ def main(argv=None):
     p.add_argument("--base", default="", help="base commit")
     p.add_argument("--room", default="", help="announce room")
     p.add_argument("--lease", type=int, default=LEASE_DEFAULT)
+    p.add_argument("--secret-file", default="",
+                   help="sign the job with this crew secret (HMAC-SHA256)")
     p.set_defaults(fn=cmd_post)
 
     p = sub.add_parser("list", help="list jobs")
@@ -475,6 +597,9 @@ def main(argv=None):
     p.add_argument("id")
     p.add_argument("--room", default="", help="announce room override")
     p.add_argument("--lease", type=int, default=LEASE_DEFAULT)
+    p.add_argument("--secret-file", default="",
+                   help="verify a signed job's HMAC before claiming; "
+                        "refuses on BAD signature")
     p.set_defaults(fn=cmd_claim)
 
     p = sub.add_parser("heartbeat", help="renew the claim lease")
@@ -511,6 +636,12 @@ def main(argv=None):
                        help="requeue all lease-expired claims")
     p.add_argument("--room", default="", help="announce room override")
     p.set_defaults(fn=cmd_sweep)
+
+    p = sub.add_parser("verify", help="verify a signed job's HMAC")
+    p.add_argument("id")
+    p.add_argument("--secret-file", required=True,
+                   help="crew secret file to verify against")
+    p.set_defaults(fn=cmd_verify)
 
     args = ap.parse_args(argv)
     return args.fn(args)

@@ -284,4 +284,131 @@ class ClaimRollbackTest(RelayTestCase):
         self.assertEqual(h["status"], "open")
 
 
+class SignedJobTest(RelayTestCase):
+    def setUp(self):
+        super().setUp()
+        # crew secret file both sides share out-of-band
+        self.secret_file = os.path.join(self.tmpdir(), "job-secret")
+        with open(self.secret_file, "wb") as f:
+            f.write(b"crew-secret-abc\n")
+        self.other_secret = os.path.join(self.tmpdir(), "wrong-secret")
+        with open(self.other_secret, "wb") as f:
+            f.write(b"wrong-secret-xyz")
+
+    def tmpdir(self):
+        d = getattr(self, "_tmpdir", None)
+        if d is None:
+            import tempfile
+            d = self._tmpdir = tempfile.mkdtemp()
+            self.addCleanup(__import__("shutil").rmtree, d,
+                            ignore_errors=True)
+        return d
+
+    def post_signed(self, **kw):
+        args = ["post", "--title", kw.get("title", "T"),
+                "--spec", kw.get("spec", "do the thing"),
+                "--secret-file", self.secret_file]
+        for k in ("accept", "branch", "base", "room"):
+            if kw.get(k):
+                args += ["--" + k, kw[k]]
+        return self.run_cli(jobs.main, args)
+
+    def test_post_signed_stores_sig(self):
+        rc, out, err = self.post_signed()
+        self.assertEqual(rc, 0)
+        self.assertIn("JOB 1", out)
+        h, _ = jobs.job_get("1")
+        self.assertIn("sig", h)
+        self.assertEqual(h["signed_by"], "tester")
+        self.assertEqual(len(h["sig"]), 64)  # sha256 hex
+
+    def test_post_unsigned_has_no_sig(self):
+        rc, out, err = self.run_cli(
+            jobs.main, ["post", "--title", "T", "--spec", "s"])
+        self.assertEqual(rc, 0)
+        h, _ = jobs.job_get("1")
+        self.assertNotIn("sig", h)
+
+    def test_post_bad_secret_file_errors(self):
+        rc, out, err = self.run_cli(
+            jobs.main, ["post", "--title", "T", "--spec", "s",
+                        "--secret-file", "/nonexistent/secret"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot read secret file", err)
+
+    def test_verify_ok(self):
+        self.post_signed()
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_verify_unsigned(self):
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "UNSIGNED")
+
+    def test_verify_wrong_secret(self):
+        self.post_signed()
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.other_secret])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_verify_tampered_spec(self):
+        self.post_signed()
+        # attacker rewrites the spec in Redis directly
+        jobs.api_post("set/muse-bus:tjob:1:spec", "do the EVIL thing")
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_verify_tampered_field(self):
+        self.post_signed(title="Original title")
+        jobs._hset("muse-bus:tjob:1", {"title": "PWNED title"})
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_verify_unknown_job(self):
+        rc, out, err = self.run_cli(
+            jobs.main, ["verify", "99", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 2)
+        self.assertIn("no such job", err)
+
+    def test_claim_signed_ok(self):
+        self.post_signed()
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 0)
+        self.assertIn("CLAIMED 1", out)
+
+    def test_claim_refuses_tampered(self):
+        self.post_signed()
+        jobs.api_post("set/muse-bus:tjob:1:spec", "do the EVIL thing")
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 1)
+        self.assertIn("signature BAD", err)
+        h, _ = jobs.job_get("1")
+        self.assertEqual(h["status"], "open")  # still unclaimed
+
+    def test_claim_unsigned_with_secret_still_works(self):
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        rc, out, err = self.run_cli(
+            jobs.main, ["claim", "1", "--secret-file", self.secret_file])
+        self.assertEqual(rc, 0)
+        self.assertIn("CLAIMED 1", out)
+
+    def test_show_displays_signed_by(self):
+        self.post_signed()
+        rc, out, err = self.run_cli(jobs.main, ["show", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("signed_by: tester", out)
+
+
 if __name__ == "__main__":    unittest.main()
