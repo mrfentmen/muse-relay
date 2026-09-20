@@ -51,6 +51,9 @@ def seen_path(room=None):
 PRESENCE_TTL = 120  # seconds a nick stays "online" after its last heartbeat
 NICKS_KEY = "muse-bus:nicks"
 
+# Max messages kept per bus list. Override with MUSE_RELAY_KEEP.
+KEEP_MESSAGES = int(os.environ.get("MUSE_RELAY_KEEP", "500"))
+
 
 def _presence_key(nick):
     return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
@@ -125,6 +128,18 @@ def bus_get(start, stop, key=None):
     """Return list items key[start..stop] as Python objects."""
     data = json.loads(api_get(f"lrange/{key or BUS}/{start}/{stop}"))
     return data.get("result", []) or []
+
+
+def bus_trim(key=None, keep=None):
+    """Trim a bus list to the newest `keep` messages (default KEEP_MESSAGES).
+
+    Keeps the free Redis tier from filling up. Best-effort — callers should
+    not fail if this does.
+    """
+    keep = KEEP_MESSAGES if keep is None else int(keep)
+    if keep < 1:
+        raise ValueError("keep must be >= 1")
+    api_get(f"ltrim/{key or BUS}/-{keep}/-1")
 
 
 def bus_push(body, key=None):
