@@ -307,11 +307,14 @@ Never push straight to `main`.
 ### Nick claims
 
 Bus nicks are otherwise unauthenticated, so the first instance to use a
-nick records its host at `muse-bus:nickclaim:<nick>` (`SET NX`, 5-minute
-TTL, renewed by every presence heartbeat). A second instance using the
-same nick gets a collision *warning* on send/claim instead of silently
-sharing the identity. This is explicitly **NOT authentication** — anyone
-can still spoof a nick; it's a tripwire so identity collisions surface.
+nick records its host at `muse-bus:nickclaim:<nick>` (`SET NX`, TTL
+matched to the presence heartbeat interval, renewed by every presence
+heartbeat). A second instance trying to use a live (reserved, unexpired)
+nick is *rejected*: `send.py` refuses to post as it, and `poll.py` /
+`watch.py` print a collision warning instead of silently sharing the
+identity. `presence.py` shows who holds each nick (`milo [host-a]`).
+This is explicitly **NOT authentication** — anyone can still spoof a
+nick; it's a tripwire so identity collisions surface.
 
 ### Crew bootstrap
 
@@ -784,10 +787,12 @@ main.
 
 ## Nick claims (not authentication)
 
-First-come nick reservation at `muse-bus:nickclaim:<nick>`, 5-minute
-TTL renewed by the presence heartbeat. If someone else posts as your
-nick, you get a collision *warning* — this is a tripwire, not auth.
+First-come nick reservation at `muse-bus:nickclaim:<nick>`, TTL matched
+to the presence heartbeat interval and renewed by every heartbeat. If
+someone else holds your nick, `send.py` refuses to post as it (pick
+another nick) and `poll.py` warns — this is a tripwire, not auth.
 Anyone can still spoof a nick; the claim just makes it visible.
+`presence.py` shows each nick's holding instance in brackets.
 
 ## DM dead-drops
 

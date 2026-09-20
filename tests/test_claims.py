@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import RelayTestCase
 import relay_common as rc
+import presence
 import send
 import poll
 import watch
@@ -29,12 +30,22 @@ class NickClaimTest(RelayTestCase):
 
     def test_claim_renewed_by_heartbeat(self):
         rc.nick_claim()
-        self.fake.advance(200)  # within the 300s TTL
+        self.fake.advance(100)  # within the TTL (matched to presence)
         rc.presence_beat()
         # another host still can't take it
         self.set_nick("tester", "host-b")
         ok, holder = rc.nick_claim()
         self.assertFalse(ok)
+
+    def test_claim_ttl_matches_presence_interval(self):
+        # The reservation lapses exactly when presence does: both are
+        # renewed by every heartbeat.
+        self.assertEqual(rc.NICKCLAIM_TTL, rc.PRESENCE_TTL)
+        rc.nick_claim()
+        self.fake.advance(rc.PRESENCE_TTL + 1)  # no renewal: both lapse
+        self.set_nick("tester", "host-b")
+        ok, holder = rc.nick_claim(force=True)
+        self.assertEqual((ok, holder), (True, "host-b"))
 
     def test_claim_expires(self):
         rc.nick_claim()
@@ -57,18 +68,71 @@ class NickClaimTest(RelayTestCase):
         rc.nick_claim()
         self.assertEqual(rc.nick_holder("tester"), "host-a")
 
-    def test_send_warns_on_conflict(self):
-        # someone else holds our nick
-        self.fake.api_get("set/muse-bus:nickclaim:tester/host-evil/NX/EX/300")
+    def test_send_rejects_conflicting_nick(self):
+        # someone else holds our nick: the send is rejected, nothing posted
+        self.fake.api_get(
+            f"set/muse-bus:nickclaim:tester/host-evil/NX/EX/{rc.NICKCLAIM_TTL}")
         rc_, out, err = self.run_cli(send.main, ["hello"])
-        self.assertEqual(rc_, 0)  # still sends; warns
-        self.assertIn("WARNING: nick 'tester' is claimed by instance "
-                      "'host-evil'", err)
+        self.assertEqual(rc_, 2)
+        self.assertIn("reserved by instance 'host-evil'", err)
+        self.assertIn("pick another nick", err)
+        self.assertEqual(self.pushes_to("muse-bus"), [])
+
+    def test_first_send_reserves_nick(self):
+        # first use of a nick reserves it via the send path
+        self.assertIsNone(rc.nick_holder("tester"))
+        rc_, out, err = self.run_cli(send.main, ["hello"])
+        self.assertEqual(rc_, 0, err)
+        self.assertEqual(rc.nick_holder("tester"), "host-a")
+
+    def test_send_rejected_after_claim_lapses(self):
+        # holder goes quiet past the TTL: the nick frees up, send works
+        rc.nick_claim()  # host-a
+        self.set_nick("tester", "host-b")
+        rc_, out, err = self.run_cli(send.main, ["hello"])
+        self.assertEqual(rc_, 2)  # rejected while the claim is live
+        self.fake.advance(rc.NICKCLAIM_TTL + 1)
+        rc_, out, err = self.run_cli(send.main, ["hello"])
+        self.assertEqual(rc_, 0, err)
+        self.assertIn("tester: hello", self.pushes_to("muse-bus"))
 
     def test_send_quiet_without_conflict(self):
         rc_, out, err = self.run_cli(send.main, ["hello"])
         self.assertEqual(rc_, 0)
         self.assertNotIn("claimed by", err)
+
+
+class PresenceClaimDisplayTest(RelayTestCase):
+    def test_presence_shows_claim_holders(self):
+        rc.presence_beat()  # tester/host-a: heartbeat + nick claim
+        self.set_nick("other", "host-b")
+        rc.presence_beat()
+        rc_, out, err = self.run_cli(presence.main, [])
+        self.assertEqual(rc_, 0, err)
+        self.assertIn("tester [host-a]", out)
+        self.assertIn("other [host-b]", out)
+
+    def test_presence_bare_when_nick_unclaimed(self):
+        # ghost is online (live heartbeat) but holds no reservation
+        self.fake.api_get("setex/muse-bus:presence:ghost/120/1")
+        self.fake.api_get("sadd/muse-bus:nicks/ghost")
+        rc_, out, err = self.run_cli(presence.main, [])
+        self.assertEqual(rc_, 0, err)
+        self.assertIn("ghost", out)
+        self.assertNotIn("ghost [", out)
+
+    def test_presence_holder_combines_with_status(self):
+        rc.presence_beat()
+        rc.status_set("heads down")
+        rc_, out, err = self.run_cli(presence.main, [])
+        self.assertEqual(rc_, 0, err)
+        self.assertIn("tester [host-a] (heads down)", out)
+
+    def test_nick_holders_batch(self):
+        rc.presence_beat()  # claims tester for host-a
+        self.assertEqual(rc.nick_holders(["tester", "nobody"]),
+                         {"tester": "host-a"})
+        self.assertEqual(rc.nick_holders([]), {})
 
 
 class DmRoomTest(RelayTestCase):
