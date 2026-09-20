@@ -177,8 +177,8 @@
   Upstash instance.
   Click any job card for its full spec, acceptance criteria and history.
   Tap any <u style="text-decoration-style:dotted">person's name</u> (or a chip
-  in the people strip) to rename them — renames are HMAC-signed admin writes
-  to the relay's name registry and audit log; everything else here is read-only.
+  in the people strip) to rename them — renames are open writes to the
+  relay's name registry; everything else here is read-only.
 </div>
 <div id="renameModal" class="modal" hidden>
   <div class="sheet" role="dialog" aria-label="rename person">
@@ -186,15 +186,15 @@
     <div class="fine">currently shows as: <span id="rn-current"></span></div>
     <label for="rn-display">new display name</label>
     <input id="rn-display" type="text" maxlength="32" autocomplete="off">
-    <label for="rn-actor">admin nick</label>
+    <label for="rn-actor">your nick (recorded as who set it)</label>
     <input id="rn-actor" type="text" autocomplete="off">
     <div class="msg" id="rn-msg"></div>
     <div class="row">
       <button id="rn-go">rename</button>
       <button id="rn-cancel" class="ghost">cancel</button>
     </div>
-    <div class="fine">Signed with your admin secret (see Admin). The rename is
-    written to the relay's name registry + signed audit log, and takes effect
+    <div class="fine">No key needed — renames are open. The rename is written
+    directly to the relay's name registry + history, and takes effect
     everywhere in the relay — message prefixes, presence, this board.</div>
   </div>
 </div>
@@ -612,9 +612,6 @@ async function openRename(nick) {
   } catch (e) {
     $("rn-current").textContent = "(couldn't load)";
   }
-  if (!adminSecretHex()) {
-    setRnMsg("No admin secret set — open Admin to set it up first.", "err");
-  }
   setTimeout(() => $("rn-display").focus(), 50);
 }
 
@@ -627,38 +624,18 @@ async function submitRename() {
   const nick = renameTarget;
   const display = $("rn-display").value.trim();
   const actor = ($("rn-actor").value.trim() || adminNick());
-  const secretHex = adminSecretHex();
   saveAdminNick(actor);
   if (!nick) return;
   if (!display) { setRnMsg("Display name is empty.", "err"); return; }
   if (display.length > 32) { setRnMsg("Display name too long (max 32 chars).", "err"); return; }
   if (/[:\n\r]/.test(display)) { setRnMsg("Display name may not contain ':' or newlines.", "err"); return; }
-  if (!secretHex || !/^[0-9a-fA-F]{64}$/.test(secretHex)) {
-    setRnMsg("No valid admin secret set — open Admin to set it up.", "err"); return;
-  }
-  if (!crypto.subtle) { setRnMsg("This browser can't do the signing (needs a secure context).", "err"); return; }
   try {
-    setRnMsg("checking admin…", "");
-    const h = await api("/get/" + ADMIN_PREFIX + ":admin:secret_sha256");
-    const calc = await sha256Hex(hexToBytes(secretHex));
-    if (!h.result || h.result !== calc) {
-      throw new Error("admin secret does not match — check Admin setup");
-    }
-    const a = await api("/smembers/" + ADMIN_PREFIX + ":admins");
-    if (!((a.result || []).includes(actor))) {
-      throw new Error("nick '" + actor + "' is not an admin");
-    }
-    setRnMsg("signing + writing…", "");
+    setRnMsg("writing…", "");
     const ts = Math.floor(Date.now() / 1000);
-    const nonce = randHexBytes(8);
-    const sig = await hmacHex(secretHex,
-      canonicalRenameEnvelope(actor, nick, display, ts, nonce));
     await apiPost("/hset/" + ADMIN_PREFIX + ":names/" + qNick(nick),
       namesHashEntry(actor, display, ts));
     await apiPost("/rpush/" + ADMIN_PREFIX + ":names:history",
       namesHistoryEntry(actor, nick, display, ts));
-    await apiPost("/rpush/" + ADMIN_PREFIX + ":admin:log",
-      renameLogEntry(actor, nick, display, ts, nonce, sig));
     setRnMsg("Renamed '" + nick + "' → '" + display + "'.", "ok");
     await refreshPeople();
   } catch (e) {
