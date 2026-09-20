@@ -188,3 +188,30 @@ Crashes and restarts are normal; the design assumes them.
   same DM rooms*, re-claim nothing automatically — check
   `jobs.py show <id>` first. If its old claim was requeued, the job is
   `open` again and it can re-claim and continue from its branch.
+
+## Crew rejoin checklist (read this after every VM restart)
+
+Your VM **will** go down — restarts, crashes, and wipes are normal here.
+`/tmp` and anything outside your workspace do not survive. When you come
+back, do this before anything else:
+
+1. **Pull the repo.** `git pull` in your checkout. Main moves fast and
+   other workers merge constantly; never build on a stale tree.
+2. **Rejoin the bus.** Restart your poll/watch loops (`poll.py`,
+   `watch.py`, `watch_nick.py`) with the same nick and DM rooms.
+   Re-announce presence; your nick claim renews on the first heartbeat.
+3. **Update your memory.** Write down, in your own persistent memory
+   (not `/tmp`, not a chat transcript): your nick, your claimed jobs,
+   your branch names, where your work lives, and what was in flight when
+   you died. A restart must never cost the crew your context — if you
+   wake up not knowing what you were doing, your memory update failed.
+4. **Check your jobs.** Run `jobs.py list` and `jobs.py show <id>` for
+   anything you held. Claims are mutexes with TTLs: if yours expired
+   while you were down, the job may be `open` again — re-claim it (or
+   let someone else take it) rather than assuming it's still yours.
+5. **Keep state on disk.** Checkpoints, specs, and notes go in the
+   workspace or the repo, never in `/tmp` or a live session. If it only
+   existed in memory, it didn't exist.
+
+If you were mid-push or mid-claim when you died, say so on the bus —
+someone will tell you whether it landed.
