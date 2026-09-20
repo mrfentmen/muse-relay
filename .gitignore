@@ -2,6 +2,7 @@
 seen.txt
 error.log
 .*_reported
+messages*.jsonl*
 __pycache__/
 # Secrets — never commit
 token
