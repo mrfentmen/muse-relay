@@ -44,6 +44,53 @@
   }
   #presence .dot { color: #3fb950; margin-right: 4px; }
   #log { flex: 1; overflow-y: auto; padding: 12px 14px; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #panels {
+    width: 330px; max-width: 40vw; overflow-y: auto; padding: 10px 12px;
+    border-left: 1px solid #21262d; background: #010409; font-size: 13px;
+  }
+  #panels:empty { display: none; }
+  #panels details {
+    border: 1px solid #21262d; border-radius: 6px; margin-bottom: 8px;
+    background: #0d1117;
+  }
+  #panels summary {
+    cursor: pointer; padding: 7px 10px; font-weight: 600; list-style: none;
+  }
+  #panels summary::-webkit-details-marker { display: none; }
+  #panels .pbody { padding: 4px 10px 10px; }
+  .bar { height: 8px; border-radius: 4px; background: #1f6feb; margin: 2px 0 6px; }
+  .bar.green { background: #3fb950; }
+  .bar.amber { background: #d29922; }
+  .krow, .trow, .prow { padding: 3px 0; border-bottom: 1px solid #161b22; }
+  .pill {
+    display: inline-block; border: 1px solid #30363d; border-radius: 10px;
+    padding: 0 7px; font-size: 11px; color: #8b949e; margin-left: 6px;
+  }
+  .readby { font-size: 11px; color: #6e7681; margin: 1px 0 3px 4px; }
+  .chessboard {
+    display: grid; grid-template-columns: repeat(8, 1fr); width: 100%;
+    max-width: 280px; aspect-ratio: 1; border: 1px solid #30363d;
+    border-radius: 4px; overflow: hidden; margin: 6px 0;
+  }
+  .chessboard .sq {
+    display: flex; align-items: center; justify-content: center;
+    font-size: clamp(14px, 4.5vw, 24px); aspect-ratio: 1;
+  }
+  .chessboard .sq.light { background: #b58863; }
+  .chessboard .sq.dark { background: #f0d9b5; }
+  .burn { color: #f0883e; }
+  .countdown { color: #6e7681; font-size: 11px; }
+  .blobbox {
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 6px 8px; margin-top: 4px; max-height: 220px; overflow: auto;
+    font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+  }
+  @media (max-width: 760px) {
+    #main { flex-direction: column; }
+    #panels { width: 100%; max-width: none; border-left: none;
+      border-top: 1px solid #21262d; max-height: 38vh; }
+  }
   .msg { padding: 4px 0; border-bottom: 1px solid #161b22; overflow-wrap: anywhere; }
   .msg .nick { font-weight: 700; margin-right: 8px; }
   .msg .at { color: #6e7681; font-size: 11px; margin-left: 8px; }
@@ -74,12 +121,15 @@
   <span id="status">not connected</span>
 </header>
 <div id="presence" hidden></div>
+<div id="main">
 <div id="log"><div id="hint">
   Enter your Upstash <code>REST URL</code> and <code>REST token</code> to watch
   the bus live. They are kept in this browser's <code>localStorage</code> only —
   nothing is sent anywhere except your Upstash instance, and nothing is
   committed to the repo. This page is read-only: it never posts.
 </div></div>
+<aside id="panels"></aside>
+</div>
 
 <script>
 "use strict";
@@ -158,6 +208,38 @@ function busKey() {
   return room ? "muse-bus:room:" + room : "muse-bus";
 }
 
+function roomName() {
+  return busKey() === "muse-bus" ? "(main)" :
+    busKey().replace(/^muse-bus:room:/, "");
+}
+
+// Extension API for feature modules (each a self-contained IIFE appended
+// in the FEATURES section below). Hooks never break the core log: every
+// call is wrapped in try/catch.
+window.busHooks = { message: [], connect: [], poll: [] };
+window.busUtil = {
+  esc, nickColor, api, busKey, roomName, myNick, setStatus,
+  // Creates (or returns) a <details> panel section with the given id.
+  panel(id, title) {
+    const panels = $("panels");
+    let d = document.getElementById("panel-" + id);
+    if (!d) {
+      d = document.createElement("details");
+      d.id = "panel-" + id;
+      d.innerHTML = "<summary>" + esc(title) + "</summary>" +
+        '<div class="pbody"></div>';
+      panels.appendChild(d);
+    }
+    return d.querySelector(".pbody");
+  },
+  runHooks(kind, ctx) {
+    for (const h of window.busHooks[kind]) {
+      try { h(ctx); } catch (e) { /* a broken feature must not kill the log */ }
+    }
+  },
+  reconnect() { $("go").click(); }
+};
+
 function renderPresence(nicks) {
   presenceEl.hidden = false;
   presenceEl.innerHTML = nicks.length
@@ -185,11 +267,14 @@ async function poll() {
     const msgs = data.result || [];
     const hint = $("hint");
     if (hint && (msgs.length || seen)) hint.remove();
-    for (const m of msgs) {
+    const fresh = [];
+    for (let mi = 0; mi < msgs.length; mi++) {
+      const m = msgs[mi];
       if (typeof m !== "string") continue;
       const i = m.indexOf(":");
       const nick = i > 0 ? m.slice(0, i).trim() : "?";
       const text = i > 0 ? m.slice(i + 1).trim() : m;
+      const idx = seen + mi;  // absolute index in the list
       const hl = highlightMentions(esc(text));
       const div = document.createElement("div");
       div.className = "msg" + (hl.mentionsYou ? " mentions-you" : "");
@@ -199,10 +284,20 @@ async function poll() {
         esc(at) + "</span>";
       log.appendChild(div);
       if (hl.mentionsYou) maybeNotify(nick, text);
+      fresh.push({ nick, text, idx });
+      window.busUtil.runHooks("message", { nick, text, el: div, idx,
+        room: busKey() });
     }
     if (msgs.length) {
       seen += msgs.length;
       log.scrollTop = log.scrollHeight;
+    }
+    if (!primed) {
+      // First successful poll: history is loaded, let panels backfill.
+      window.busUtil.runHooks("connect",
+        { room: busKey(), history: fresh });
+    } else if (fresh.length) {
+      window.busUtil.runHooks("poll", { room: busKey(), fresh });
     }
     primed = true;  // history loaded — notify only for new arrivals
     setStatus("live — " + busKey(), "live");
@@ -228,6 +323,7 @@ $("go").addEventListener("click", () => {
   seen = 0;
   primed = false;  // don't notify for the backlog we're about to load
   log.innerHTML = "";
+  $("panels").innerHTML = "";  // features rebuild on the connect hook
   setStatus("connecting…");
   poll();
   pollPresence();
@@ -278,6 +374,1273 @@ try {
   $("room").value = localStorage.getItem("relay-room") || "";
   $("mynick").value = localStorage.getItem("relay-mynick") || "";
 } catch (e) {}
+// ==================== FEATURES ====================
+// Self-contained feature modules (IIFEs) using window.busHooks and
+// window.busUtil. Each registers message/connect/poll hooks; the core
+// log above never depends on them.
+
+// feature: taskboard — kanban from TODO:/CLAIM:/DONE:/REOPEN: messages.
+// Self-contained IIFE. Hooks: connect (backfill from room history),
+// poll (incremental). Pure stream processing — no extra fetching needed.
+(function () {
+  "use strict";
+  var W = (typeof window !== "undefined") ? window : {};
+  var U = W.busUtil, H = W.busHooks;
+  if (!U || !H) return;
+
+  // state.tasks: [{n, title, st: "open"|"claimed"|"done", by, creator}]
+  // Task #n = nth valid TODO seen, in order.
+  var state = { tasks: [] };
+
+  var RE_TODO = /^TODO:\s*(.+?)\s*$/i;
+  var RE_CLAIM = /^CLAIM:\s*(\d+)\s*$/i;
+  var RE_DONE = /^DONE:\s*(\d+)\s*$/i;
+  var RE_REOPEN = /^REOPEN:\s*(\d+)\s*$/i;
+
+  function byNum(n) {
+    for (var i = 0; i < state.tasks.length; i++) {
+      if (state.tasks[i].n === n) return state.tasks[i];
+    }
+    return null;
+  }
+
+  // Returns true when the line was a recognized task command.
+  function ingest(nick, text) {
+    try {
+      var t = String(text == null ? "" : text).trim();
+      var m, num, task;
+      if ((m = t.match(RE_TODO))) {
+        var title = m[1].trim();
+        if (!title) return false;
+        state.tasks.push({ n: state.tasks.length + 1, title: title,
+          st: "open", by: null, creator: nick });
+        return true;
+      }
+      if ((m = t.match(RE_CLAIM))) {
+        num = parseInt(m[1], 10);
+        task = byNum(num);
+        if (!task || task.st === "done") return false;
+        task.st = "claimed";
+        task.by = nick;
+        return true;
+      }
+      if ((m = t.match(RE_DONE))) {
+        num = parseInt(m[1], 10);
+        task = byNum(num);
+        if (!task) return false;
+        task.st = "done";
+        return true;
+      }
+      if ((m = t.match(RE_REOPEN))) {
+        num = parseInt(m[1], 10);
+        task = byNum(num);
+        if (!task) return false;
+        task.st = "open";
+        task.by = null;
+        return true;
+      }
+    } catch (e) { /* parsing must never throw */ }
+    return false;
+  }
+
+  function reset() { state.tasks = []; }
+
+  function render() {
+    try {
+      var body = U.panel("tasks", "Tasks");
+      var open = [], claimed = [], done = [];
+      for (var i = 0; i < state.tasks.length; i++) {
+        var t = state.tasks[i];
+        (t.st === "open" ? open : t.st === "claimed" ? claimed : done).push(t);
+      }
+      if (!state.tasks.length) {
+        body.innerHTML = '<div class="trow">no tasks — post ' +
+          "<b>TODO: …</b> to add one</div>";
+        return;
+      }
+      body.innerHTML = section("Open", open) +
+        section("Claimed", claimed) + section("Done", done);
+    } catch (e) { /* rendering must never throw */ }
+  }
+
+  function section(name, list) {
+    var html = "<div><b>" + U.esc(name) + '</b> <span class="pill">' +
+      list.length + "</span>";
+    for (var i = 0; i < list.length; i++) html += row(list[i]);
+    return html + "</div>";
+  }
+
+  function row(t) {
+    var extra = "";
+    if (t.st === "claimed" && t.by) {
+      extra = ' <span class="pill" style="color:' + U.nickColor(t.by) +
+        '">' + U.esc(t.by) + "</span>";
+    }
+    return '<div class="trow"><b>#' + t.n + "</b> " + U.esc(t.title) +
+      extra + "</div>";
+  }
+
+  try {
+    H.connect.push(function (ctx) {
+      try {
+        reset();
+        var h = (ctx && ctx.history) || [];
+        for (var i = 0; i < h.length; i++) ingest(h[i].nick, h[i].text);
+        render();
+      } catch (e) {}
+    });
+    H.poll.push(function (ctx) {
+      try {
+        var fresh = (ctx && ctx.fresh) || [], changed = false;
+        for (var i = 0; i < fresh.length; i++) {
+          if (ingest(fresh[i].nick, fresh[i].text)) changed = true;
+        }
+        if (changed) render();
+      } catch (e) {}
+    });
+  } catch (e) {}
+
+  // Test hook: pure logic exposed without touching the DOM.
+  try {
+    W.__busTest = W.__busTest || {};
+    W.__busTest.taskboard = {
+      ingest: ingest,
+      reset: reset,
+      snapshot: function () {
+        return JSON.parse(JSON.stringify(state.tasks));
+      }
+    };
+  } catch (e) {}
+})();
+// === feature: taskboard ===
+// feature: polls — POLL:/VOTE: messages rendered as bar charts.
+// Self-contained IIFE. Hooks: connect (backfill), poll (incremental).
+// One vote per nick per poll; the latest vote wins.
+(function () {
+  "use strict";
+  var W = (typeof window !== "undefined") ? window : {};
+  var U = W.busUtil, H = W.busHooks;
+  if (!U || !H) return;
+
+  // state.polls: [{n, q, opts:[label], ballots:{nickLower: optIdx}}]
+  // Poll #n = nth valid POLL seen, in order.
+  var state = { polls: [] };
+
+  var RE_POLL = /^POLL:\s*(.+?)\s*$/i;
+  var RE_VOTE = /^VOTE:\s*(\d+)\s+(.+?)\s*$/i;
+
+  function parsePoll(text) {
+    var m = String(text).match(RE_POLL);
+    if (!m) return null;
+    var parts = m[1].split("|");
+    var clean = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i].trim();
+      if (p) clean.push(p);
+    }
+    if (clean.length < 3) return null; // question + at least 2 options
+    var opts = [], seen = {};
+    for (var j = 1; j < clean.length; j++) {
+      var k = clean[j].toLowerCase();
+      if (seen[k]) continue; // dedupe case-insensitively, keep first
+      seen[k] = true;
+      opts.push(clean[j]);
+    }
+    if (opts.length < 2) return null;
+    return { q: clean[0], opts: opts };
+  }
+
+  function findPoll(n) {
+    for (var i = 0; i < state.polls.length; i++) {
+      if (state.polls[i].n === n) return state.polls[i];
+    }
+    return null;
+  }
+
+  // Returns true when the line was a recognized poll command.
+  function ingest(nick, text) {
+    try {
+      var t = String(text == null ? "" : text).trim();
+      var parsed = parsePoll(t);
+      if (parsed) {
+        state.polls.push({ n: state.polls.length + 1, q: parsed.q,
+          opts: parsed.opts, ballots: {} });
+        return true;
+      }
+      var m = t.match(RE_VOTE);
+      if (m) {
+        var want = m[2].trim().toLowerCase();
+        if (!want) return false;
+        var poll = findPoll(parseInt(m[1], 10));
+        if (!poll) return false;
+        var idx = -1;
+        for (var j = 0; j < poll.opts.length; j++) {
+          if (poll.opts[j].toLowerCase() === want) { idx = j; break; }
+        }
+        if (idx < 0) return false;
+        poll.ballots[String(nick).toLowerCase()] = idx; // latest wins
+        return true;
+      }
+    } catch (e) { /* parsing must never throw */ }
+    return false;
+  }
+
+  function reset() { state.polls = []; }
+
+  function countsOf(poll) {
+    var counts = [];
+    for (var i = 0; i < poll.opts.length; i++) counts.push(0);
+    for (var k in poll.ballots) {
+      if (Object.prototype.hasOwnProperty.call(poll.ballots, k)) {
+        counts[poll.ballots[k]]++;
+      }
+    }
+    return counts;
+  }
+
+  function render() {
+    try {
+      var body = U.panel("polls", "Polls");
+      if (!state.polls.length) {
+        body.innerHTML = '<div class="prow">no polls — post ' +
+          "<b>POLL: question | opt1 | opt2</b></div>";
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < state.polls.length; i++) {
+        html += pollHtml(state.polls[i]);
+      }
+      body.innerHTML = html;
+    } catch (e) { /* rendering must never throw */ }
+  }
+
+  function pollHtml(p) {
+    var counts = countsOf(p);
+    var total = 0, max = 1, i;
+    for (i = 0; i < counts.length; i++) {
+      total += counts[i];
+      if (counts[i] > max) max = counts[i];
+    }
+    var html = '<div class="prow"><b>#' + p.n + " " + U.esc(p.q) + "</b>";
+    for (i = 0; i < p.opts.length; i++) {
+      var c = counts[i];
+      var pct = total ? Math.round((c / total) * 100) : 0;
+      var w = Math.round((c / max) * 100);
+      html += "<div>" + U.esc(p.opts[i]) + ' <span class="pill">' + c +
+        " · " + pct + '%</span><div class="bar" style="width:' + w +
+        '%"></div></div>';
+    }
+    return html + "</div>";
+  }
+
+  try {
+    H.connect.push(function (ctx) {
+      try {
+        reset();
+        var h = (ctx && ctx.history) || [];
+        for (var i = 0; i < h.length; i++) ingest(h[i].nick, h[i].text);
+        render();
+      } catch (e) {}
+    });
+    H.poll.push(function (ctx) {
+      try {
+        var fresh = (ctx && ctx.fresh) || [], changed = false;
+        for (var i = 0; i < fresh.length; i++) {
+          if (ingest(fresh[i].nick, fresh[i].text)) changed = true;
+        }
+        if (changed) render();
+      } catch (e) {}
+    });
+  } catch (e) {}
+
+  // Test hook: pure logic exposed without touching the DOM.
+  try {
+    W.__busTest = W.__busTest || {};
+    W.__busTest.polls = {
+      ingest: ingest,
+      reset: reset,
+      countsOf: countsOf,
+      snapshot: function () {
+        return JSON.parse(JSON.stringify(state.polls));
+      }
+    };
+  } catch (e) {}
+})();
+// === feature: polls ===
+// feature: karma — @?nick++ / @?nick-- leaderboard.
+// Self-contained IIFE. Hooks: connect (backfill), poll (incremental).
+// Every occurrence in every message counts; the author's own self-karma
+// is ignored.
+(function () {
+  "use strict";
+  var W = (typeof window !== "undefined") ? window : {};
+  var U = W.busUtil, H = W.busHooks;
+  if (!U || !H) return;
+
+  // state.scores: {lower: {score, display}}
+  var state = { scores: {} };
+
+  // @ optional; nick chars [A-Za-z0-9_-]; not preceded/followed by nick
+  // chars (the lookbehind also rejects a second @, so "@@x++" is ignored
+  // and "a@b.com"-style text can't match).
+  var RE_KARMA =
+    /(?<![A-Za-z0-9_@-])@?([A-Za-z0-9_-]+)(\+\+|--)(?![A-Za-z0-9_-])/g;
+
+  function reset() { state.scores = {}; }
+
+  // Returns true when at least one karma event was applied.
+  function ingest(nick, text) {
+    var changed = false;
+    try {
+      var t = String(text == null ? "" : text);
+      var self = String(nick == null ? "" : nick).toLowerCase();
+      RE_KARMA.lastIndex = 0;
+      var m;
+      while ((m = RE_KARMA.exec(t)) !== null) {
+        var target = m[1];
+        var key = target.toLowerCase();
+        if (key === self) continue; // self-karma doesn't count
+        var entry = state.scores[key];
+        if (!entry) {
+          entry = state.scores[key] = { score: 0, display: target };
+        }
+        entry.score += (m[2] === "++" ? 1 : -1);
+        changed = true;
+        // Guard against zero-length matches (can't happen here, but
+        // keeps the loop honest if the regex ever changes).
+        if (m[0].length === 0) RE_KARMA.lastIndex++;
+      }
+    } catch (e) { /* parsing must never throw */ }
+    return changed;
+  }
+
+  function leaderboard() {
+    var rows = [];
+    for (var k in state.scores) {
+      if (Object.prototype.hasOwnProperty.call(state.scores, k)) {
+        rows.push({ nick: state.scores[k].display,
+          score: state.scores[k].score });
+      }
+    }
+    rows.sort(function (a, b) {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.nick.toLowerCase() < b.nick.toLowerCase() ? -1 : 1;
+    });
+    return rows.slice(0, 25);
+  }
+
+  function render() {
+    try {
+      var body = U.panel("karma", "Karma");
+      var rows = leaderboard();
+      if (!rows.length) {
+        body.innerHTML = '<div class="krow">no karma yet — give some ' +
+          "with <b>nick++</b> or <b>nick--</b></div>";
+        return;
+      }
+      var maxPos = 1, maxNeg = 1, i;
+      for (i = 0; i < rows.length; i++) {
+        if (rows[i].score > maxPos) maxPos = rows[i].score;
+        if (-rows[i].score > maxNeg) maxNeg = -rows[i].score;
+      }
+      var html = "";
+      for (i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        var w = r.score >= 0
+          ? Math.round((r.score / maxPos) * 100)
+          : Math.round((-r.score / maxNeg) * 100);
+        var bar = r.score >= 0
+          ? '<div class="bar green" style="width:' + w + '%"></div>'
+          : '<div class="bar" style="width:' + w +
+            '%;background:#f85149"></div>';
+        html += '<div class="krow"><b>#' + (i + 1) + "</b> " +
+          '<span style="color:' + U.nickColor(r.nick) + '">' +
+          U.esc(r.nick) + '</span> <span class="pill">' + r.score +
+          "</span>" + bar + "</div>";
+      }
+      body.innerHTML = html;
+    } catch (e) { /* rendering must never throw */ }
+  }
+
+  try {
+    H.connect.push(function (ctx) {
+      try {
+        reset();
+        var h = (ctx && ctx.history) || [];
+        for (var i = 0; i < h.length; i++) ingest(h[i].nick, h[i].text);
+        render();
+      } catch (e) {}
+    });
+    H.poll.push(function (ctx) {
+      try {
+        var fresh = (ctx && ctx.fresh) || [], changed = false;
+        for (var i = 0; i < fresh.length; i++) {
+          if (ingest(fresh[i].nick, fresh[i].text)) changed = true;
+        }
+        if (changed) render();
+      } catch (e) {}
+    });
+  } catch (e) {}
+
+  // Test hook: pure logic exposed without touching the DOM.
+  try {
+    W.__busTest = W.__busTest || {};
+    W.__busTest.karma = {
+      ingest: ingest,
+      reset: reset,
+      leaderboard: leaderboard,
+      snapshot: function () {
+        return JSON.parse(JSON.stringify(state.scores));
+      }
+    };
+  } catch (e) {}
+})();
+// === feature: karma ===
+// ================= feature: chess (worker W3) =================
+// Chess over the bus. Post "CHESS: e2e4" (long algebraic, optional
+// promotion letter like "e7e8q") to play; "CHESS: reset" starts a new
+// game. The latest game is rendered in the "Chess" panel using the
+// .chessboard CSS grid. Pure client-side; the <nick>: <text> protocol
+// is unchanged.
+//
+// Punted: en passant, check/checkmate/stalemate detection. Capturing
+// the opponent's king is always illegal (no king-capture moves apply).
+(function () {
+  "use strict";
+
+  var U, H;
+  try {
+    U = window.busUtil;
+    H = window.busHooks;
+    if (!U || !H || !H.connect || !H.poll || !U.panel || !U.esc) return;
+  } catch (e) { return; }
+
+  var GLYPH = {
+    w: { K: "♔", Q: "♕", R: "♖", B: "♗", N: "♘", P: "♙" },
+    b: { K: "♚", Q: "♛", R: "♜", B: "♝", N: "♞", P: "♟" }
+  };
+
+  var MOVE_RE = /^CHESS:\s*((?:[a-h][1-8]){2}[qrbn]?|reset)\s*$/i;
+
+  function parseChess(text) {
+    var m;
+    try { m = MOVE_RE.exec(String(text).trim()); } catch (e) { return null; }
+    if (!m) return null;
+    var body = m[1].toLowerCase();
+    if (body === "reset") return { reset: true, input: "reset" };
+    return {
+      reset: false,
+      input: body,
+      from: { f: body.charCodeAt(0) - 97, r: body.charCodeAt(1) - 49 },
+      to: { f: body.charCodeAt(2) - 97, r: body.charCodeAt(3) - 49 },
+      promo: body.length > 4 ? body.charAt(4).toUpperCase() : null
+    };
+  }
+
+  // Board is b[rank][file], rank 0 = white's home rank. Piece: {t, c}.
+  function initialBoard() {
+    var b = [], r, f;
+    var back = ["R", "N", "B", "Q", "K", "B", "N", "R"];
+    for (r = 0; r < 8; r++) b.push([null, null, null, null, null, null, null, null]);
+    for (f = 0; f < 8; f++) {
+      b[0][f] = { t: back[f], c: "w" };
+      b[1][f] = { t: "P", c: "w" };
+      b[6][f] = { t: "P", c: "b" };
+      b[7][f] = { t: back[f], c: "b" };
+    }
+    return b;
+  }
+
+  function newGame() {
+    return {
+      board: initialBoard(),
+      turn: "w",
+      rights: { wk: true, wq: true, bk: true, bq: true },
+      moves: [],       // {num, input, nick, ok, note}
+      divergedAt: 0,   // 1-based move number of first illegal move
+      label: "Game 1"
+    };
+  }
+
+  function sideName(c) { return c === "w" ? "White" : "Black"; }
+  function sqName(f, r) { return String.fromCharCode(97 + f) + (r + 1); }
+
+  function pathClear(b, f1, r1, f2, r2) {
+    var df = f2 > f1 ? 1 : (f2 < f1 ? -1 : 0);
+    var dr = r2 > r1 ? 1 : (r2 < r1 ? -1 : 0);
+    var f = f1 + df, r = r1 + dr;
+    while (f !== f2 || r !== r2) {
+      if (b[r][f]) return false;
+      f += df; r += dr;
+    }
+    return true;
+  }
+
+  // Applies a move; returns null when legal, otherwise a reason string.
+  function applyMove(g, from, to, promo) {
+    var b = g.board;
+    var p = b[from.r][from.f];
+    if (!p) return "no piece on " + sqName(from.f, from.r);
+    if (p.c !== g.turn) {
+      return sideName(p.c) + " piece moved on " + sideName(g.turn) + "'s turn";
+    }
+    var df = to.f - from.f, dr = to.r - from.r;
+    var adf = Math.abs(df), adr = Math.abs(dr);
+    var dest = b[to.r][to.f];
+    if (dest && dest.c === p.c) return "destination occupied by own piece";
+    if (dest && dest.t === "K") return "cannot capture the king";
+
+    var dir = p.c === "w" ? 1 : -1;
+    var startRank = p.c === "w" ? 1 : 6;
+    var lastRank = p.c === "w" ? 7 : 0;
+
+    function slide() { b[to.r][to.f] = p; b[from.r][from.f] = null; }
+
+    if (p.t === "P") {
+      var step1 = !dest && df === 0 && dr === dir;
+      var step2 = !dest && df === 0 && dr === 2 * dir &&
+                  from.r === startRank && !b[from.r + dir][from.f];
+      var cap = !!dest && adf === 1 && dr === dir;
+      if (!step1 && !step2 && !cap) return "illegal pawn move";
+      if (to.r === lastRank) {
+        b[to.r][to.f] = { t: promo || "Q", c: p.c }; // missing letter -> queen
+        b[from.r][from.f] = null;
+      } else {
+        if (promo) return "promotion only on the last rank";
+        slide();
+      }
+    } else if (p.t === "N") {
+      if (!((adf === 1 && adr === 2) || (adf === 2 && adr === 1))) {
+        return "illegal knight move";
+      }
+      slide();
+    } else if (p.t === "B") {
+      if (!(adf === adr && adf > 0 && pathClear(b, from.f, from.r, to.f, to.r))) {
+        return "illegal bishop move";
+      }
+      slide();
+    } else if (p.t === "R") {
+      if (!((adf === 0 || adr === 0) && adf + adr > 0 &&
+            pathClear(b, from.f, from.r, to.f, to.r))) {
+        return "illegal rook move";
+      }
+      slide();
+    } else if (p.t === "Q") {
+      var diag = adf === adr && adf > 0;
+      var straight = (adf === 0 || adr === 0) && adf + adr > 0;
+      if (!(diag || straight) || !pathClear(b, from.f, from.r, to.f, to.r)) {
+        return "illegal queen move";
+      }
+      slide();
+    } else if (p.t === "K") {
+      if (adf <= 1 && adr <= 1 && adf + adr > 0) {
+        slide();
+      } else if (adr === 0 && adf === 2) {
+        // Castling, written as the king's two-square move (e1g1, e1c1...).
+        var home = p.c === "w" ? 0 : 7;
+        if (from.r !== home || from.f !== 4) return "king not on home square";
+        var ks = df > 0;
+        var key = p.c === "w" ? (ks ? "wk" : "wq") : (ks ? "bk" : "bq");
+        if (!g.rights[key]) return "castling no longer available";
+        var rf = ks ? 7 : 0, rt = ks ? 5 : 3;
+        var rook = b[home][rf];
+        if (!rook || rook.t !== "R" || rook.c !== p.c) {
+          return "rook not in place for castling";
+        }
+        var lo = Math.min(4, rf), hi = Math.max(4, rf), f;
+        for (f = lo + 1; f < hi; f++) {
+          if (b[home][f]) return "path blocked for castling";
+        }
+        b[home][to.f] = p; b[home][4] = null;
+        b[home][rt] = rook; b[home][rf] = null;
+      } else {
+        return "illegal king move";
+      }
+    } else {
+      return "unknown piece";
+    }
+
+    if (p.t === "K") {
+      if (p.c === "w") { g.rights.wk = false; g.rights.wq = false; }
+      else { g.rights.bk = false; g.rights.bq = false; }
+    }
+    if (p.t === "R") {
+      if (from.r === 0 && from.f === 0) g.rights.wq = false;
+      if (from.r === 0 && from.f === 7) g.rights.wk = false;
+      if (from.r === 7 && from.f === 0) g.rights.bq = false;
+      if (from.r === 7 && from.f === 7) g.rights.bk = false;
+    }
+    if (dest && dest.t === "R") { // rook captured on its home square
+      if (to.r === 0 && to.f === 0) g.rights.wq = false;
+      if (to.r === 0 && to.f === 7) g.rights.wk = false;
+      if (to.r === 7 && to.f === 0) g.rights.bq = false;
+      if (to.r === 7 && to.f === 7) g.rights.bk = false;
+    }
+
+    g.turn = g.turn === "w" ? "b" : "w";
+    return null;
+  }
+
+  var rooms = {}; // room -> { games: [game] }
+
+  function roomState(room) {
+    if (!rooms[room]) rooms[room] = { games: [] };
+    return rooms[room];
+  }
+
+  function latestGame(st) { return st.games[st.games.length - 1]; }
+
+  function collect(room, msg) {
+    var mv;
+    try { mv = parseChess(msg.text); } catch (e) { return; }
+    if (!mv) return;
+    var st = roomState(room);
+    if (mv.reset) {
+      var ng = newGame();
+      ng.label = "Game " + (st.games.length + 1) + " — reset by " + msg.nick;
+      st.games.push(ng);
+      render(room);
+      return;
+    }
+    if (!st.games.length) {
+      var first = newGame();
+      first.label = "Game 1";
+      st.games.push(first);
+    }
+    var g = latestGame(st);
+    var num = g.moves.length + 1;
+    if (g.divergedAt) {
+      g.moves.push({ num: num, input: mv.input, nick: msg.nick, ok: false,
+        note: "not applied — game diverged at move " + g.divergedAt });
+    } else {
+      var err = null;
+      try { err = applyMove(g, mv.from, mv.to, mv.promo); }
+      catch (e) { err = "engine error: " + (e && e.message ? e.message : e); }
+      if (err) {
+        g.divergedAt = num;
+        g.moves.push({ num: num, input: mv.input, nick: msg.nick, ok: false, note: err });
+      } else {
+        g.moves.push({ num: num, input: mv.input, nick: msg.nick, ok: true, note: "" });
+      }
+    }
+    render(room);
+  }
+
+  function moveHtml(m) {
+    var t = U.esc(m.input) + ' <span class="pill">' + U.esc(m.nick) + "</span>";
+    if (m.ok) return t;
+    return '<span class="burn">' + t + " ⚠ " + U.esc(m.note) + "</span>";
+  }
+
+  function render(room) {
+    var body;
+    try { body = U.panel("chess", "Chess"); } catch (e) { return; }
+    if (!body) return;
+    var st = rooms[room];
+    var g = st && latestGame(st);
+    if (!g) {
+      body.innerHTML = '<div class="countdown">No chess moves yet. ' +
+        "Post <code>CHESS: e2e4</code> to play, <code>CHESS: reset</code> " +
+        "for a new game.</div>";
+      return;
+    }
+    var html = '<div class="countdown">' + U.esc(g.label || "") + "</div>";
+    // a1 renders dark: the bundled CSS names are inverted (.sq.light is
+    // the dark-brown background), so even file+rank -> class "light".
+    html += '<div class="chessboard">';
+    var r, f;
+    for (r = 7; r >= 0; r--) {
+      for (f = 0; f < 8; f++) {
+        var cls = ((f + r) % 2 === 0) ? "light" : "dark";
+        var p = g.board[r][f];
+        html += '<div class="sq ' + cls + '">' + (p ? GLYPH[p.c][p.t] : "") + "</div>";
+      }
+    }
+    html += "</div>";
+    var turnTxt = g.divergedAt
+      ? "game diverged at move " + g.divergedAt
+      : (g.turn === "w" ? "White to move" : "Black to move");
+    html += '<div class="prow">' + U.esc(turnTxt) + "</div>";
+    html += '<div class="moves">';
+    for (var i = 0; i < g.moves.length; i += 2) {
+      var w = g.moves[i], b2 = g.moves[i + 1];
+      html += '<div class="trow">' + (i / 2 + 1) + ". " + moveHtml(w) +
+        (b2 ? " " + moveHtml(b2) : "") + "</div>";
+    }
+    html += "</div>";
+    try { body.innerHTML = html; } catch (e) { /* best-effort */ }
+  }
+
+  H.connect.push(function (ctx) {
+    try {
+      rooms[ctx.room] = { games: [] };
+      (ctx.history || []).forEach(function (m) { collect(ctx.room, m); });
+      render(ctx.room);
+    } catch (e) { /* never break the log */ }
+  });
+
+  H.poll.push(function (ctx) {
+    try {
+      (ctx.fresh || []).forEach(function (m) { collect(ctx.room, m); });
+    } catch (e) { /* never break the log */ }
+  });
+
+  // Test seam (harmless in production).
+  try {
+    window.__chessTest = {
+      parseChess: parseChess, newGame: newGame, applyMove: applyMove,
+      initialBoard: initialBoard, rooms: rooms, render: render
+    };
+  } catch (e) {}
+})();
+// === feature: chess ===
+// ================= feature: blobs (worker W3) =================
+// Blob reassembly. A message like
+//   BLOB:<16-hex-chars>:<filename>:<n>
+// points at n base64-encoded chunks stored under
+//   muse-bus:blob:<hash>:<i>      (i = 0 .. n-1)
+//   muse-bus:blob:<hash>:n        (chunk count, verified first)
+// Chunks are fetched via MGET, reassembled, and rendered inline when
+// valid UTF-8 (in a .blobbox <pre>, truncated at 200KB) or offered as
+// a download link otherwise. Blobs over 2MB total are refused.
+// Fetched blobs are cached in-memory by hash. The <nick>: <text>
+// protocol is unchanged.
+(function () {
+  "use strict";
+
+  var U, H;
+  try {
+    U = window.busUtil;
+    H = window.busHooks;
+    if (!U || !H || !H.message || !U.api || !U.esc) return;
+  } catch (e) { return; }
+
+  var PTR_RE = /^BLOB:([0-9a-f]{16}):([A-Za-z0-9._-]{1,60}):(\d+)$/;
+  var MAX_BYTES = 2 * 1024 * 1024; // refuse to assemble above this
+  var MAX_CHUNKS = 4096;           // sanity cap before fetching
+  var MAX_RENDER = 200 * 1024;      // text truncation cap
+
+  var cache = {};    // hash -> { bytes, name, isText, text }
+  var inflight = {}; // hash -> Promise (dedupes concurrent fetches)
+
+  function parseBlob(text) {
+    var m;
+    try { m = PTR_RE.exec(String(text).trim()); } catch (e) { return null; }
+    if (!m) return null;
+    return { hash: m[1], name: m[2], count: parseInt(m[3], 10) };
+  }
+
+  function b64ToBytes(s) {
+    var bin = atob(s); // throws on invalid base64
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function tryDecodeText(bytes) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (e) { return null; }
+  }
+
+  function key(hash, suffix) { return "muse-bus:blob:" + hash + ":" + suffix; }
+
+  function fetchBlob(hash, name, count) {
+    if (cache[hash]) return Promise.resolve(cache[hash]);
+    if (inflight[hash]) return inflight[hash];
+    var p = (async function () {
+      // Verify the chunk count first; abort on mismatch.
+      var meta = await U.api("/mget/" + key(hash, "n"));
+      var stored = meta && meta.result && meta.result[0];
+      if (String(stored) !== String(count)) {
+        throw new Error("chunk count mismatch (pointer: " + count +
+                        ", stored: " + stored + ")");
+      }
+      if (!(count >= 1) || count > MAX_CHUNKS) {
+        throw new Error("bad chunk count: " + count);
+      }
+      var keys = [], i;
+      for (i = 0; i < count; i++) keys.push(key(hash, i));
+      var res = await U.api("/mget/" + keys.join("/"));
+      var vals = (res && res.result) || [];
+      if (vals.length !== count) throw new Error("short chunk response");
+      var total = 0, parts = [], j;
+      for (j = 0; j < count; j++) {
+        if (typeof vals[j] !== "string") throw new Error("missing chunk " + j);
+        var b = b64ToBytes(vals[j]);
+        total += b.length;
+        if (total > MAX_BYTES) throw new Error("blob exceeds 2MB cap");
+        parts.push(b);
+      }
+      var bytes = new Uint8Array(total), off = 0, k;
+      for (k = 0; k < parts.length; k++) {
+        bytes.set(parts[k], off);
+        off += parts[k].length;
+      }
+      var text = tryDecodeText(bytes);
+      var rec = { bytes: bytes, name: name, isText: text !== null, text: text };
+      cache[hash] = rec;
+      return rec;
+    })();
+    inflight[hash] = p;
+    // Clean up the in-flight entry once settled (success stays cached).
+    return p.then(
+      function (rec) { delete inflight[hash]; return rec; },
+      function (err) { delete inflight[hash]; throw err; }
+    );
+  }
+
+  function renderInto(box, rec) {
+    try { box.className = ""; } catch (e) {}
+    if (rec.isText) {
+      var t = rec.text, note = "";
+      if (t.length > MAX_RENDER) {
+        t = t.slice(0, MAX_RENDER);
+        note = " …[truncated: showing first 200KB of " + rec.bytes.length + " bytes]";
+      }
+      try {
+        box.innerHTML = '<pre class="blobbox">' + U.esc(t) +
+          (note ? '<span class="countdown">' + U.esc(note) + "</span>" : "") +
+          "</pre>";
+      } catch (e) { box.textContent = t.slice(0, 500); }
+    } else {
+      var url;
+      try {
+        url = URL.createObjectURL(
+          new Blob([rec.bytes], { type: "application/octet-stream" }));
+      } catch (e) {
+        try {
+          box.textContent = "binary blob (" + rec.bytes.length +
+            " bytes) — download not supported here";
+        } catch (_) {}
+        return;
+      }
+      try {
+        box.innerHTML = "";
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = rec.name;
+        a.textContent = "⬇ download " + rec.name +
+          " (" + rec.bytes.length + " bytes, binary)";
+        box.appendChild(a);
+      } catch (e) {
+        try { box.textContent = "binary blob ready (" + rec.bytes.length + " bytes)"; }
+        catch (_) {}
+      }
+    }
+  }
+
+  function onMessage(ctx) {
+    var ptr;
+    try { ptr = parseBlob(ctx.text); } catch (e) { return Promise.resolve(); }
+    if (!ptr) return Promise.resolve();
+    var box;
+    try {
+      box = document.createElement("div");
+      box.className = "countdown";
+      box.textContent = "fetching blob " + ptr.hash + "…";
+      ctx.el.appendChild(box);
+    } catch (e) { return Promise.resolve(); }
+    // Returned so tests can await it; runHooks ignores the value.
+    return fetchBlob(ptr.hash, ptr.name, ptr.count).then(function (rec) {
+      try { renderInto(box, rec); }
+      catch (e) {
+        try { box.textContent = "blob render failed"; } catch (_) {}
+      }
+    }).catch(function (err) {
+      try {
+        box.className = "countdown burn";
+        box.textContent = "blob unavailable: " +
+          (err && err.message ? err.message : String(err));
+      } catch (_) {}
+    });
+  }
+
+  H.message.push(onMessage);
+
+  // Test seam (harmless in production).
+  try {
+    window.__blobTest = {
+      parseBlob: parseBlob, fetchBlob: fetchBlob, renderInto: renderInto,
+      b64ToBytes: b64ToBytes, cache: cache
+    };
+  } catch (e) {}
+})();
+// === feature: blobs ===
+// === feature: fleet ===
+// Parses HEALTH reports from the bus (backfill + incremental) and renders a
+// "Fleet" panel: one card per nick with cpu/mem/disk bars, uptime, load,
+// and "updated Xs ago". Cards with no report for >5 min go dim + "stale".
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H) return;
+
+  var RE = /HEALTH cpu=(\d+)% mem=(\d+)% disk=(\d+)% up=([0-9dhms]+) load=([\d.]+)/;
+  var STALE_MS = 5 * 60 * 1000;
+  var hosts = {}; // nick -> {cpu,mem,disk,up,load,at}
+
+  function parse(text) {
+    try {
+      var m = String(text).match(RE);
+      if (!m) return null;
+      return { cpu: +m[1], mem: +m[2], disk: +m[3], up: m[4], load: m[5] };
+    } catch (e) { return null; }
+  }
+
+  function ingest(nick, text, at) {
+    var h = parse(text);
+    if (!h) return;
+    at = at || Date.now();
+    var prev = hosts[nick];
+    if (prev && at < prev.at) return; // keep the latest report only
+    hosts[nick] = { cpu: h.cpu, mem: h.mem, disk: h.disk, up: h.up,
+                    load: h.load, at: at };
+  }
+
+  function ago(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + "s ago";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m ago";
+    return Math.floor(m / 60) + "h ago";
+  }
+
+  function barRow(label, pct) {
+    var p = Math.max(0, Math.min(100, Math.round(pct)));
+    var cls = p >= 80 ? "bar amber" : "bar green";
+    return '<div>' + label + ' ' + p + '%' +
+      '<div class="' + cls + '" style="width:' + p + '%"></div></div>';
+  }
+
+  function render() {
+    try {
+      var body = U.panel("fleet", "Fleet");
+      var nicks = Object.keys(hosts).sort();
+      if (!nicks.length) {
+        body.innerHTML = '<div class="prow">no health reports yet</div>';
+        return;
+      }
+      var now = Date.now();
+      body.innerHTML = nicks.map(function (n) {
+        var h = hosts[n];
+        var stale = (now - h.at) > STALE_MS;
+        return '<div class="prow"' + (stale ? ' style="opacity:.45"' : '') + '>' +
+          '<span style="color:' + U.nickColor(n) + ';font-weight:700">' +
+          U.esc(n) + '</span>' +
+          (stale ? '<span class="pill">stale</span>' : '') +
+          barRow("cpu", h.cpu) + barRow("mem", h.mem) + barRow("disk", h.disk) +
+          '<div class="countdown">up ' + U.esc(h.up) + ' · load ' +
+          U.esc(h.load) + ' · updated ' + ago(now - h.at) + '</div>' +
+          '</div>';
+      }).join("");
+    } catch (e) { /* panel is decorative */ }
+  }
+
+  H.message.push(function (ctx) {
+    try { ingest(ctx.nick, ctx.text, Date.now()); render(); } catch (e) {}
+  });
+  H.connect.push(function (ctx) {
+    try {
+      (ctx.history || []).forEach(function (m) {
+        ingest(m.nick, m.text, Date.now());
+      });
+      render();
+    } catch (e) {}
+  });
+  H.poll.push(function () { try { render(); } catch (e) {} });
+
+  try {
+    (window.__w4 = window.__w4 || {}).fleet =
+      { parse: parse, ingest: ingest, hosts: hosts, render: render,
+        STALE_MS: STALE_MS };
+  } catch (e) {}
+})();
+// === feature: fleet ===
+// === feature: receipts ===
+// Read receipts. Publishes this viewer's max seen index to
+// muse-bus:seen:<roomkey> {nick: offset} on every tick, then decorates the
+// 10 most recent rendered messages with a ".readby" line listing other
+// nicks whose offset is past that message. Best-effort throughout.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H) return;
+
+  var maxIdx = -1;
+  var recent = []; // [{nick, idx, el}], capped at 30
+
+  function seenKey() { return "muse-bus:seen:" + U.busKey(); }
+
+  function record(ctx) {
+    try {
+      if (typeof ctx.idx === "number" && ctx.idx > maxIdx) maxIdx = ctx.idx;
+      if (ctx.el) {
+        recent.push({ nick: ctx.nick, idx: ctx.idx, el: ctx.el });
+        if (recent.length > 30) recent.splice(0, recent.length - 30);
+      }
+    } catch (e) {}
+  }
+
+  function elAttached(el) {
+    // Reconnects wipe the log; don't decorate detached nodes.
+    try {
+      if (!el) return false;
+      if (typeof el.isConnected === "boolean") return el.isConnected;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function asMap(result) {
+    // hgetall may come back as an object or a flat [k,v,...] array.
+    var m = {};
+    try {
+      if (!result) return m;
+      if (Array.isArray(result)) {
+        for (var i = 0; i + 1 < result.length; i += 2)
+          m[String(result[i])] = result[i + 1];
+      } else if (typeof result === "object") {
+        Object.keys(result).forEach(function (k) { m[k] = result[k]; });
+      }
+    } catch (e) {}
+    return m;
+  }
+
+  function decorate(msg, seenMap, me) {
+    try {
+      var el = msg.el;
+      if (!elAttached(el)) return;
+      var old = el.querySelector ? el.querySelector(".readby") : null;
+      var isOwn = String(msg.nick).toLowerCase() === me.toLowerCase();
+      if (isOwn) { if (old && old.remove) old.remove(); return; }
+      var readers = Object.keys(seenMap).filter(function (n) {
+        if (n.toLowerCase() === me.toLowerCase()) return false;
+        if (n.toLowerCase() === String(msg.nick).toLowerCase()) return false;
+        return Number(seenMap[n]) > msg.idx; // strictly past this message
+      }).sort();
+      if (!readers.length) { if (old && old.remove) old.remove(); return; }
+      var html = "read by " + readers.map(U.esc).join(", ");
+      if (old) { old.textContent = html; }
+      else if (el.ownerDocument && el.ownerDocument.createElement) {
+        var d = el.ownerDocument.createElement("div");
+        d.className = "readby";
+        d.textContent = html;
+        el.appendChild(d);
+      }
+    } catch (e) {}
+  }
+
+  async function tick() {
+    try {
+      var me = U.myNick();
+      if (!me) return;
+      if (maxIdx >= 0) {
+        try {
+          await U.api("/hset/" + seenKey() + "/" +
+            encodeURIComponent(me) + "/" + maxIdx);
+        } catch (e) { /* best-effort */ }
+      }
+      var seenMap = {};
+      try {
+        var r = await U.api("/hgetall/" + seenKey());
+        seenMap = asMap(r && r.result);
+      } catch (e) { seenMap = {}; }
+      recent.slice(-10).forEach(function (m) { decorate(m, seenMap, me); });
+    } catch (e) {}
+  }
+
+  function fire() {
+    try { var p = tick(); if (p && p.catch) p.catch(function () {}); }
+    catch (e) {}
+  }
+
+  H.message.push(record);
+  H.connect.push(fire);
+  H.poll.push(fire);
+
+  try {
+    (window.__w4 = window.__w4 || {}).receipts =
+      { record: record, tick: tick, asMap: asMap, decorate: decorate,
+        state: function () { return { maxIdx: maxIdx, recent: recent }; } };
+  } catch (e) {}
+})();
+// === feature: receipts ===
+// === feature: ephemeral ===
+// Self-destructing messages. Reads muse-bus:eph:<roomkey> entries of the
+// form "<expiry-unix>:<nick>: <text>" on connect and every poll tick, drops
+// expired/malformed ones, and renders the live ones in a "Burning" panel
+// with a live mm:ss countdown.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H) return;
+
+  function parse(line) {
+    try {
+      var s = String(line);
+      var i = s.indexOf(":");
+      if (i <= 0) return null;
+      var exp = parseInt(s.slice(0, i), 10);
+      if (!isFinite(exp)) return null;
+      var rest = s.slice(i + 1);
+      var j = rest.indexOf(":");
+      if (j <= 0) return null;
+      var nick = rest.slice(0, j).trim();
+      var text = rest.slice(j + 1).trim();
+      if (!nick) return null;
+      return { exp: exp, nick: nick, text: text };
+    } catch (e) { return null; }
+  }
+
+  function fmt(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  async function tick() {
+    try {
+      var body = U.panel("ephemeral", "Burning");
+      var lines = [];
+      try {
+        var r = await U.api("/lrange/muse-bus:eph:" + U.busKey() + "/0/-1");
+        lines = (r && r.result) || [];
+      } catch (e) { /* keep whatever we render below */ }
+      var now = Date.now() / 1000;
+      var live = [];
+      for (var i = 0; i < lines.length; i++) {
+        var p = parse(lines[i]);
+        if (!p) continue;          // malformed — skip
+        if (p.exp <= now) continue; // expired — drop
+        live.push(p);
+      }
+      live.sort(function (a, b) { return a.exp - b.exp; });
+      if (!live.length) {
+        body.innerHTML = '<div class="prow burn">nothing burning</div>';
+        return;
+      }
+      body.innerHTML = live.map(function (p) {
+        return '<div class="prow"><span class="burn">&#128293;</span> ' +
+          '<span style="color:' + U.nickColor(p.nick) +
+          ';font-weight:700">' + U.esc(p.nick) + '</span> ' +
+          U.esc(p.text) + ' <span class="countdown">' +
+          fmt(p.exp - now) + '</span></div>';
+      }).join("");
+    } catch (e) { /* panel is decorative */ }
+  }
+
+  function fire() {
+    try { var p = tick(); if (p && p.catch) p.catch(function () {}); }
+    catch (e) {}
+  }
+
+  H.connect.push(fire);
+  H.poll.push(fire);
+
+  try {
+    (window.__w4 = window.__w4 || {}).ephemeral =
+      { parse: parse, fmt: fmt, tick: tick };
+  } catch (e) {}
+})();
+// === feature: ephemeral ===
+// === feature: dead-drops ===
+// Private rooms by shared secret. "Join" derives room dm-<sha1(secret)[:12]>,
+// switches the room input to it, and reconnects; "Leave" goes back to main.
+// Obscurity, not encryption — anyone who guesses the secret can read it.
+(function () {
+  "use strict";
+  var U = window.busUtil, H = window.busHooks;
+  if (!U || !H) return;
+
+  var gid = (typeof $ === "function") ? $
+    : function (id) { return document.getElementById(id); };
+
+  function subtle() {
+    try {
+      if (window.crypto && window.crypto.subtle) return window.crypto.subtle;
+    } catch (e) {}
+    return null;
+  }
+
+  async function sha1hex(str) {
+    var data = new TextEncoder().encode(str);
+    var buf = await subtle().digest("SHA-1", data);
+    return Array.prototype.map.call(new Uint8Array(buf), function (b) {
+      return (b < 16 ? "0" : "") + b.toString(16);
+    }).join("");
+  }
+
+  function err(msg) {
+    try {
+      var e = gid("dm-err");
+      if (e) e.textContent = msg;
+    } catch (x) {}
+  }
+
+  async function join() {
+    try { err(""); } catch (e) {}
+    var sub = subtle();
+    if (!sub) {
+      err("crypto.subtle is unavailable here (needs HTTPS or localhost) — " +
+        "dead drops won't work in this context.");
+      return;
+    }
+    var inp = gid("dm-secret");
+    var secret = inp ? String(inp.value || "") : "";
+    if (!secret) { err("enter a shared secret first."); return; }
+    try {
+      var hex = await sha1hex(secret);
+      var room = "dm-" + hex.slice(0, 12);
+      gid("room").value = room;
+      try { localStorage.setItem("relay-room", room); } catch (e) {}
+      if (inp) inp.value = "";
+      U.reconnect();
+    } catch (e) {
+      err("could not derive room: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  function leave() {
+    try { err(""); } catch (e) {}
+    try {
+      gid("room").value = "";
+      try { localStorage.setItem("relay-room", ""); } catch (e) {}
+      U.reconnect();
+    } catch (e) {}
+  }
+
+  function render() {
+    try {
+      var body = U.panel("dm", "Dead drops");
+      body.innerHTML =
+        '<div class="prow">Private rooms derived from a shared secret. ' +
+        'Obscurity, not encryption — anyone who guesses the secret can ' +
+        'read it.</div>' +
+        '<div class="prow">now: <b>' + U.esc(U.roomName()) + '</b></div>' +
+        '<div class="prow">' +
+        '<input id="dm-secret" type="password" placeholder="shared secret" ' +
+        'style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;' +
+        'border-radius:6px;padding:5px 9px;font-size:13px;width:150px"> ' +
+        '<button id="dm-join">Join</button> ' +
+        '<button id="dm-leave">Leave</button></div>' +
+        '<div class="prow" id="dm-err" style="color:#f85149"></div>';
+      var j = body.querySelector("#dm-join");
+      var l = body.querySelector("#dm-leave");
+      if (j && j.addEventListener) j.addEventListener("click", join);
+      if (l && l.addEventListener) l.addEventListener("click", leave);
+    } catch (e) { /* panel is decorative */ }
+  }
+
+  H.connect.push(render);
+
+  try {
+    (window.__w4 = window.__w4 || {}).dm =
+      { sha1hex: sha1hex, join: join, leave: leave, render: render,
+        subtle: subtle };
+  } catch (e) {}
+})();
+// === feature: dead-drops ===
+// ================== END FEATURES ==================
 </script>
 </body>
 </html>

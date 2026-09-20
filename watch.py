@@ -76,7 +76,7 @@ def main(argv=None):
                 time.sleep(args.interval)
                 continue
             try:
-                presence_beat(key)
+                presence_beat()
             except Exception as e:
                 print(f"WARNING: presence heartbeat failed ({e})",
                       file=sys.stderr)

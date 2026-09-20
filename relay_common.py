@@ -61,20 +61,15 @@ def _presence_key(nick):
     return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
 
 
-def presence_beat(roomkey=None):
+def presence_beat():
     """Heartbeat: mark this nick online for PRESENCE_TTL seconds.
 
     Called automatically by send.py, poll.py and watch.py on successful
-    bus contact. When roomkey is given, also marks the nick present in
-    that specific room. Best-effort — callers should not fail if this
-    does.
+    bus contact. Best-effort — callers should not fail if this does.
     """
     q = urllib.parse.quote(NICK, safe="")
     api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
     api_get(f"sadd/{NICKS_KEY}/{q}")
-    if roomkey:
-        api_get(f"setex/muse-bus:presence:room:{roomkey}:{q}/"
-                f"{PRESENCE_TTL}/1")
 
 
 def presence_list():
@@ -221,84 +216,3 @@ def blob_expire(h, n, seconds):
     """Best-effort EXPIRE on a blob's chunk keys and its count key."""
     for i in list(range(n)) + ["n"]:
         api_get(f"expire/muse-bus:blob:{h}:{i}/{int(seconds)}")
-
-
-RECUR_KEY = "muse-bus:recur"
-ROOMDIR_KEY = "muse-bus:roomdir"
-TYPING_TTL = 10  # seconds a typing indicator stays live
-
-
-def typing_ping(roomkey, nick):
-    """One-shot typing indicator: SETEX muse-bus:typing:<room>:<nick>."""
-    q = urllib.parse.quote(nick, safe="")
-    api_get(f"setex/muse-bus:typing:{roomkey}:{q}/{TYPING_TTL}/1")
-
-
-def recur_add(roomkey, nick, text, every_secs):
-    """Register a recurring message; timecapsule.py delivers + reschedules.
-
-    Member JSON {"text","room","nick","every"} (sort_keys) scored at the
-    next run time. Returns the first run's unix timestamp.
-    """
-    every_secs = int(every_secs)
-    member = json.dumps({"text": text, "room": roomkey, "nick": nick,
-                         "every": every_secs}, sort_keys=True)
-    q = urllib.parse.quote(member, safe="")
-    when = int(time.time()) + every_secs
-    api_get(f"zadd/{RECUR_KEY}/{when}/{q}")
-    return when
-
-
-def room_touch(roomkey):
-    """Mark a room active: roomdir zset + roominfo last timestamp."""
-    now = int(time.time())
-    q = urllib.parse.quote(roomkey, safe="")
-    api_get(f"zadd/{ROOMDIR_KEY}/{now}/{q}")
-    api_get(f"hset/muse-bus:roominfo:{roomkey}/last/{now}")
-
-
-def room_set_desc(roomkey, desc):
-    """Set a room's description in its roominfo hash."""
-    q = urllib.parse.quote(desc, safe="")
-    api_get(f"hset/muse-bus:roominfo:{roomkey}/desc/{q}")
-
-
-def mod_add(roomkey, nick):
-    q = urllib.parse.quote(nick, safe="")
-    api_get(f"sadd/muse-bus:mods:{roomkey}/{q}")
-
-
-def mod_del(roomkey, nick):
-    q = urllib.parse.quote(nick, safe="")
-    api_get(f"srem/muse-bus:mods:{roomkey}/{q}")
-
-
-def mute_add(roomkey, nick):
-    q = urllib.parse.quote(nick, safe="")
-    api_get(f"sadd/muse-bus:muted:{roomkey}/{q}")
-
-
-def mute_del(roomkey, nick):
-    q = urllib.parse.quote(nick, safe="")
-    api_get(f"srem/muse-bus:muted:{roomkey}/{q}")
-
-
-_IMG_MAGICS = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8")  # PNG / JPEG / GIF
-
-
-def img_put(path):
-    """Validate an image file and store it as blob chunks.
-
-    Accepts PNG, JPEG, GIF, and WEBP (RIFF....WEBP) by magic bytes;
-    raises ValueError for anything else. Returns (hash, name, n) like
-    the --blob pointer format.
-    """
-    with open(path, "rb") as f:
-        data = f.read()
-    webp = data[:4] == b"RIFF" and data[8:12] == b"WEBP"
-    if not (webp or any(data.startswith(m) for m in _IMG_MAGICS)):
-        raise ValueError(
-            f"not a recognized image (PNG/JPEG/GIF/WEBP): {path}")
-    h, n = blob_put(data)
-    base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(path).strip())
-    return h, (base or "image")[:60], n

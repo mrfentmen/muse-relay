@@ -2,10 +2,7 @@
 """Send a message to the muse-relay bus.
 
 Usage: send.py [--room NAME] [--dm SECRET] [--at SPEC] [--ttl SPEC]
-               [--blob PATH] [--img FILE] [--every DUR] [--typing]
-               [--mod-add NICK] [--mod-del NICK] [--mute NICK]
-               [--unmute NICK] [--desc TEXT] [--topic TEXT]
-               ["message text"]
+               [--blob PATH] ["message text"]
 Posts the plain string "<nick>: <message>" to the main bus, or to a room
 with --room. Rooms are separate lists; the default room is the legacy
 'muse-bus' list, so existing setups keep working unchanged.
@@ -20,21 +17,6 @@ Idempotent: skips the send if the identical message is already at the tail.
   --blob PATH attach a file ('-' = stdin) as content-addressed chunks and
               post a BLOB:<hash>:<name>:<n> pointer instead. With --ttl the
               chunks expire too.
-  --img FILE  like --blob but only for images (PNG/JPEG/GIF/WEBP, checked
-              by magic bytes). Posts a BLOB: pointer. Combines with
-              message text, not with --at/--ttl/--every/--blob.
-  --every DUR recurring message, durations only, minimum 60s. Posts
-              nothing now; timecapsule.py delivers it every DUR and
-              reschedules. Not with --at/--ttl/--blob/--img.
-  --typing    one-shot typing-indicator ping for the room; posts nothing.
-  --mod-add N / --mod-del N
-              add/remove a room moderator (muse-bus:mods:<room> set).
-              Posts nothing.
-  --mute N / --unmute N
-              mute/unmute a nick in the room (muse-bus:muted:<room> set)
-              and post a "<nick>: MUTE:<N>" / "UNMUTE:<N>" notice.
-  --desc TEXT set the room's description (room directory); posts nothing.
-  --topic TEXT post "<nick>: TOPIC: <text>" (empty string clears it).
   --dm SECRET private dead-drop room derived as dm-<sha1(secret)[:12]>.
               Overrides --room. This is obscurity, NOT encryption: anyone
               who guesses the secret (or can read the Redis) sees the
@@ -55,8 +37,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, api_get, blob_expire, blob_put, bus_get, bus_key, bus_push,
-    bus_trim, clean_room, img_put, mod_add, mod_del, mute_add, mute_del,
-    presence_beat, recur_add, room_set_desc, room_touch, typing_ping)
+    bus_trim, clean_room, presence_beat)
 
 TIMECAPSULE_KEY = "muse-bus:timecapsule"
 
@@ -151,13 +132,9 @@ def send_ephemeral(ttl_secs, key, text):
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
     try:
-        presence_beat(key)
+        presence_beat()
     except Exception as e:
         print(f"WARNING: presence heartbeat failed ({e})", file=sys.stderr)
-    try:
-        room_touch(key)
-    except Exception as e:
-        print(f"WARNING: room touch failed ({e})", file=sys.stderr)
     try:
         bus_trim(key=eph_key, keep=200)
     except Exception as e:
@@ -183,13 +160,9 @@ def post_message(text, key):
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
     try:
-        presence_beat(key)
+        presence_beat()
     except Exception as e:
         print(f"WARNING: presence heartbeat failed ({e})", file=sys.stderr)
-    try:
-        room_touch(key)
-    except Exception as e:
-        print(f"WARNING: room touch failed ({e})", file=sys.stderr)
     try:
         bus_trim(key=key)
     except Exception as e:
@@ -212,57 +185,11 @@ def main(argv=None):
     ap.add_argument("--blob", default=None, metavar="PATH",
                     help="attach a file ('-' = stdin) as chunks; posts a "
                          "BLOB:<hash>:<name>:<n> pointer instead")
-    ap.add_argument("--img", default=None, metavar="FILE",
-                    help="like --blob but images only (PNG/JPEG/GIF/WEBP, "
-                         "magic-byte checked); posts a BLOB: pointer")
-    ap.add_argument("--every", default=None, metavar="DUR",
-                    help="recurring message, durations only, minimum 60s. "
-                         "Posts nothing now; timecapsule.py delivers it "
-                         "every DUR and reschedules")
-    ap.add_argument("--typing", action="store_true",
-                    help="one-shot typing-indicator ping; posts nothing")
-    ap.add_argument("--mod-add", default=None, metavar="NICK",
-                    help="add a room moderator; posts nothing")
-    ap.add_argument("--mod-del", default=None, metavar="NICK",
-                    help="remove a room moderator; posts nothing")
-    ap.add_argument("--mute", default=None, metavar="NICK",
-                    help="mute a nick in the room and post a MUTE: notice")
-    ap.add_argument("--unmute", default=None, metavar="NICK",
-                    help="unmute a nick in the room and post an UNMUTE: "
-                         "notice")
-    ap.add_argument("--desc", default=None, metavar="TEXT",
-                    help="set the room description; posts nothing")
-    ap.add_argument("--topic", default=None, metavar="TEXT",
-                    help="post '<nick>: TOPIC: <text>' (empty clears)")
     ap.add_argument("message", nargs="?", default=None,
-                    help="message text (optional with --blob/--img)")
+                    help="message text (optional with --blob)")
     args = ap.parse_args(argv)
     if args.at and args.ttl:
         print("ERROR: --at and --ttl don't combine", file=sys.stderr)
-        return 2
-    if args.img and (args.at or args.ttl or args.every or args.blob):
-        print("ERROR: --img doesn't combine with --at/--ttl/--every/--blob",
-              file=sys.stderr)
-        return 2
-    if args.every and (args.at or args.ttl or args.blob or args.img):
-        print("ERROR: --every doesn't combine with --at/--ttl/--blob/--img",
-              file=sys.stderr)
-        return 2
-    if args.img and (args.mute or args.unmute or args.topic is not None):
-        print("ERROR: --img doesn't combine with --mute/--unmute/--topic",
-              file=sys.stderr)
-        return 2
-    ops = [bool(args.every), bool(args.typing), args.desc is not None,
-           bool(args.mod_add), bool(args.mod_del),
-           bool(args.mute), bool(args.unmute), args.topic is not None]
-    if sum(ops) > 1:
-        print("ERROR: only one of --every/--typing/--desc/--mod-add/"
-              "--mod-del/--mute/--unmute/--topic per invocation",
-              file=sys.stderr)
-        return 2
-    if (args.mute or args.unmute or args.topic is not None) and args.message:
-        print("ERROR: --mute/--unmute/--topic don't combine with message "
-              "text", file=sys.stderr)
         return 2
     try:
         room = dm_room(args.dm) if args.dm else clean_room(args.room)
@@ -270,92 +197,6 @@ def main(argv=None):
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-
-    def beat():
-        try:
-            presence_beat(key)
-        except Exception as e:
-            print(f"WARNING: presence heartbeat failed ({e})",
-                  file=sys.stderr)
-
-    # One-shot ops that post nothing.
-    if args.typing:
-        try:
-            typing_ping(key, NICK)
-        except Exception as e:
-            print(f"RELAY_ERROR: typing ping failed ({e})", file=sys.stderr)
-            return 2
-        print(f"TYPING {key} {NICK}")
-        return 0
-
-    if args.every:
-        try:
-            every_secs = parse_duration(args.every)
-        except ValueError:
-            print(f"ERROR: --every needs a duration (30s, 10m, 2h, 1d), "
-                  f"got {args.every!r}", file=sys.stderr)
-            return 2
-        if every_secs < 60:
-            print("ERROR: --every needs at least 60s", file=sys.stderr)
-            return 2
-        text = args.message.strip() if args.message else ""
-        if not text:
-            print("ERROR: --every needs message text", file=sys.stderr)
-            return 2
-        try:
-            when = recur_add(key, NICK, text, every_secs)
-        except Exception as e:
-            print(f"RELAY_ERROR: recur schedule failed ({e})",
-                  file=sys.stderr)
-            return 2
-        beat()
-        when_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
-        print(f"RECURRING_EVERY {every_secs}s NEXT {when} ({when_s})")
-        return 0
-
-    if args.desc is not None:
-        try:
-            room_set_desc(key, args.desc)
-        except Exception as e:
-            print(f"RELAY_ERROR: desc set failed ({e})", file=sys.stderr)
-            return 2
-        beat()
-        print(f"DESC_SET {key}: {args.desc}")
-        return 0
-
-    if args.mod_add:
-        try:
-            mod_add(key, args.mod_add)
-        except Exception as e:
-            print(f"RELAY_ERROR: mod-add failed ({e})", file=sys.stderr)
-            return 2
-        beat()
-        print(f"MOD_ADDED {key} {args.mod_add}")
-        return 0
-
-    if args.mod_del:
-        try:
-            mod_del(key, args.mod_del)
-        except Exception as e:
-            print(f"RELAY_ERROR: mod-del failed ({e})", file=sys.stderr)
-            return 2
-        beat()
-        print(f"MOD_REMOVED {key} {args.mod_del}")
-        return 0
-
-    # Notice posts: mute/unmute/topic.
-    if args.mute or args.unmute:
-        target = args.mute or args.unmute
-        verb = "MUTE" if args.mute else "UNMUTE"
-        try:
-            (mute_add if args.mute else mute_del)(key, target)
-        except Exception as e:
-            print(f"RELAY_ERROR: mute update failed ({e})", file=sys.stderr)
-            return 2
-        return post_message(f"{verb}:{target}", key)
-
-    if args.topic is not None:
-        return post_message(f"TOPIC: {args.topic}", key)
 
     text = args.message.strip() if args.message else ""
     blob_info = None
@@ -373,19 +214,6 @@ def main(argv=None):
         blob_info = (h, n)
         name = "stdin" if args.blob == "-" else args.blob
         pointer = f"BLOB:{h}:{sanitize_basename(name)}:{n}"
-        text = (text + " " + pointer) if text else pointer
-
-    if args.img:
-        try:
-            h, name, n = img_put(args.img)
-        except ValueError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 2
-        except OSError as e:
-            print(f"ERROR: can't read {args.img!r}: {e}", file=sys.stderr)
-            return 2
-        pointer = f"BLOB:{h}:{name}:{n}"
-        print(f"IMAGE {args.img} -> {pointer}")
         text = (text + " " + pointer) if text else pointer
 
     if not text:
