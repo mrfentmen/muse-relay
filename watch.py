@@ -21,7 +21,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, presence_beat,
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, mark_seen, presence_beat,
     seen_path)
 
 
@@ -41,13 +41,13 @@ def write_seen(path, n):
         print(f"WARNING: seen write failed ({e})", file=sys.stderr)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=10,
                     help="seconds between polls (default: 10)")
     ap.add_argument("--room", default=None,
                     help="room to watch (default: main bus)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.interval <= 0:
         print("interval must be positive", file=sys.stderr)
         return 2
@@ -85,6 +85,11 @@ def main():
                     print(m, flush=True)
             seen += len(msgs)
             write_seen(seen_file, seen)
+            try:
+                mark_seen(key, NICK, seen)  # read receipt; never breaks watch
+            except Exception as e:
+                print(f"WARNING: read-receipt write failed ({e})",
+                      file=sys.stderr)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped", file=sys.stderr)

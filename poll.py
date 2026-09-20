@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, presence_beat,
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, mark_seen, presence_beat,
     seen_path)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,11 +28,11 @@ def log_error(msg):
         pass
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--room", default=None,
                     help="room to poll (default: main bus)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     try:
         room = clean_room(args.room)
         key = bus_key(room)
@@ -67,6 +67,10 @@ def main():
             f.write(str(seen))
     except OSError as e:
         log_error(f"seen write failed: {e}")
+    try:
+        mark_seen(key, NICK, seen)  # read receipt; never breaks the poll
+    except Exception as e:
+        log_error(f"read-receipt write failed: {e}")
     if new:
         print("NEW_MESSAGES:")
         for m in new:

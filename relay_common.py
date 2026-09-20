@@ -17,6 +17,8 @@ import re
 import subprocess
 import time
 import urllib.parse
+import base64
+import hashlib
 
 RELAY_URL = os.environ.get("MUSE_RELAY_URL", "").rstrip("/")
 BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
@@ -167,3 +169,50 @@ def bus_push(body, key=None):
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
         time.sleep(2)
     raise RuntimeError(f"push failed after 4 attempts: {last_err}")
+
+
+def mark_seen(key, nick, offset):
+    """Record a nick's read offset for a room key (read receipts).
+
+    Writes HSET muse-bus:seen:<key> <nick> <offset>. Best-effort: callers
+    must catch exceptions so a failed write never breaks polling.
+    """
+    q = urllib.parse.quote(nick, safe="")
+    api_get(f"hset/muse-bus:seen:{key}/{q}/{int(offset)}")
+
+
+BLOB_CHUNK = 90_000  # bytes per chunk; chunks are stored base64-encoded
+
+
+def blob_put(data):
+    """Store bytes as numbered base64 chunks.
+
+    Keys: muse-bus:blob:<h>:<i> for each chunk, muse-bus:blob:<h>:<n>
+    holding the chunk count. Returns (digest16, count) where digest16 is
+    the first 16 hex chars of the sha256 of the data. Chunks go through
+    the GET-based SET path, so base64 keeps them URL-safe.
+    """
+    h = hashlib.sha256(data).hexdigest()[:16]
+    n = (len(data) + BLOB_CHUNK - 1) // BLOB_CHUNK
+    for i in range(n):
+        chunk = base64.b64encode(data[i * BLOB_CHUNK:(i + 1) * BLOB_CHUNK])
+        enc = urllib.parse.quote(chunk.decode("ascii"), safe="")
+        api_get(f"set/muse-bus:blob:{h}:{i}/{enc}")
+    api_get(f"set/muse-bus:blob:{h}:n/{n}")
+    return h, n
+
+
+def blob_get(h):
+    """Reassemble bytes stored by blob_put; raises on missing chunks."""
+    count = int(json.loads(api_get(f"get/muse-bus:blob:{h}:n"))["result"])
+    out = []
+    for i in range(count):
+        enc = json.loads(api_get(f"get/muse-bus:blob:{h}:{i}"))["result"]
+        out.append(base64.b64decode(enc))
+    return b"".join(out)
+
+
+def blob_expire(h, n, seconds):
+    """Best-effort EXPIRE on a blob's chunk keys and its count key."""
+    for i in list(range(n)) + ["n"]:
+        api_get(f"expire/muse-bus:blob:{h}:{i}/{int(seconds)}")
