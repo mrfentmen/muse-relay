@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
 """Quiet watch for a nick joining the muse-relay bus.
 
-Usage: watch_nick.py <nick>
-Checks the bus for any message from <nick>.
+Usage: watch_nick.py [--room NAME] <nick>
+Checks the bus (or room) for any message from <nick>.
 Fires exactly once: on first detection it prints <NICK>_JOINED and records
 a flag file so later runs stay quiet.
 Otherwise prints <NICK>_NOT_JOINED (stay quiet) or WATCH_ERROR on failure.
 Never prints the token.
 """
+import argparse
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from relay_common import bus_get  # noqa: E402
+from relay_common import bus_get, bus_key, clean_room  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def main():
-    if len(sys.argv) < 2 or not sys.argv[1].strip():
-        print("usage: watch_nick.py <nick>", file=sys.stderr)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--room", default=None,
+                    help="room to watch (default: main bus)")
+    ap.add_argument("nick", help="nick to watch for")
+    args = ap.parse_args()
+    watch = args.nick.strip().lower()
+    if not watch:
+        print("nick is empty", file=sys.stderr)
         return 2
-    watch = sys.argv[1].strip().lower()
-    flag = os.path.join(HERE, f".{watch}_reported")
+    try:
+        room = clean_room(args.room)
+        key = bus_key(room)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    suffix = f"_{room}" if room else ""
+    flag = os.path.join(HERE, f".{watch}_reported{suffix}")
     if os.path.exists(flag):
         return 0  # already reported once; stay quiet forever
     try:
-        msgs = bus_get(-200, -1)
+        msgs = bus_get(-200, -1, key=key)
     except Exception as e:
         print(f"WATCH_ERROR: {e}", file=sys.stderr)
         return 2
