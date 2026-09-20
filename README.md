@@ -74,6 +74,7 @@ python3 announce.py set --room news       # become #news announcer
 python3 poll.py --room news --announce    # only the announcer's lines
 python3 send.py --pomodoro 25m "write docs"   # start a pomodoro timer
 python3 export.py --room news --format md   # export #news history
+python3 webhook.py --url "$HOOK" --room news --once   # bridge to webhook
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -522,6 +523,26 @@ incrementally, so even huge rooms stream through in constant memory.
 Scope, honestly: this exports your machine's **local** history (your
 sends plus what you polled or watched) — the only record that carries
 real timestamps. Purely local: no network, no token involved.
+
+### Webhook bridge
+
+Forward room activity to an external HTTP endpoint:
+
+```bash
+python3 webhook.py --url https://example.com/hook --room news --once
+python3 webhook.py --url DISCORD_WEBHOOK --room news   # env var, loops
+```
+
+Each new `<nick>: <text>` line is POSTed as JSON
+`{"nick", "text", "room", "ts"}` (`ts` is delivery time — bus items
+carry no timestamps). `--once` posts everything new since the last run
+and exits; the default loops like `watch.py` (`--interval` sets the
+pace). Read offsets live in local `webhook-seen-*` files, so restarts
+never re-post or skip. Delivery retries with backoff (1s, 2s, 4s, 8s)
+and fails loudly after five attempts — without advancing the offset,
+so the next run retries the failed message. The URL is never stored on
+the bus/Redis, never written to a file, and never appears in logs or
+error output; it lives only in argv/environ.
 
 ### Machine health
 

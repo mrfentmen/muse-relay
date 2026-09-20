@@ -24,6 +24,7 @@ import digest  # noqa: E402
 import announce  # noqa: E402
 import timecapsule  # noqa: E402
 import export  # noqa: E402
+import webhook  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 
@@ -42,7 +43,7 @@ class RelayTestCase(unittest.TestCase):
         # consumers did `from relay_common import api_get/...`: patch the
         # names in their namespaces too, not just relay_common's.
         for mod in (jobs, send, poll, watch, edits, paste, forward,
-                saved, digest, announce, timecapsule):
+                saved, digest, announce, timecapsule, webhook):
             for name in ("api_get", "api_post", "bus_push"):
                 if hasattr(mod, name):
                     p = mock.patch.object(mod, name,
@@ -59,6 +60,9 @@ class RelayTestCase(unittest.TestCase):
             mock.patch.object(watch, "seen_path",
                               lambda room: os.path.join(
                                   self.tmp, "wseen-" + (room or "main"))),
+            mock.patch.object(webhook, "seen_path",
+                              lambda room: os.path.join(
+                                  self.tmp, "hkseen-" + (room or "main"))),
             mock.patch.object(
                 store, "store_path",
                 lambda room: os.path.join(

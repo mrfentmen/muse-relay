@@ -93,7 +93,8 @@ class AnnounceTest(RelayTestCase):
         rc.api_get(f"set/muse-bus:announce:{key}/alice")
         self.fake.bus_push("alice: release notes", key=key)
         self.fake.bus_push("bob: chatter", key=key)
-        seen_file = rc.seen_path("news")
+        import os
+        seen_file = os.path.join(self.tmp, "wseen-news")
         targets = [["room 'news'", key, seen_file, 0]]
         import contextlib
         import io
