@@ -72,8 +72,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
     bus_push, bus_trim, clean_room, clip_put, dm_room, img_put, mod_add,
-    mod_del, mute_add, mute_del, nick_conflict_holder, pomo_register,
-    presence_beat,
+    mod_del, mute_add, mute_del, nick_claim, nick_conflict_holder,
+    pomo_register, presence_beat,
     recur_add, room_set_desc, room_touch, status_set, typing_ping)
 import clipboard  # noqa: E402
 import store  # noqa: E402
@@ -162,6 +162,26 @@ def warn_nick_conflict():
               f"your messages may be confused with theirs. Set "
               f"MUSE_RELAY_INSTANCE_ID uniquely or pick another nick.",
               file=sys.stderr)
+
+
+def check_nick_reservation():
+    """Reject when a different live instance holds our nick's reservation.
+
+    Runs a fresh claim check first (first use of a nick reserves it via
+    SET NX). Returns an error string when someone else holds the live
+    reservation, else None. A failed check fails open — the bus must keep
+    working when Redis is unreachable.
+    """
+    try:
+        nick_claim()
+    except Exception:
+        return None
+    holder = nick_conflict_holder()
+    if holder:
+        return (f"nick '{NICK}' is reserved by instance '{holder}' — "
+                f"pick another nick (MUSE_RELAY_NICK) or set a unique "
+                f"MUSE_RELAY_INSTANCE_ID")
+    return None
 
 
 def read_blob_source(path):
@@ -401,6 +421,13 @@ def main(argv=None):
         key = bus_key(room)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    # First-come nick reservation: refuse to act as a nick a different
+    # live instance holds. Unreserved nicks pass through untouched.
+    err = check_nick_reservation()
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
         return 2
 
     def beat():

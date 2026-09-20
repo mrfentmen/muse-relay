@@ -181,17 +181,21 @@ def presence_list():
 #
 # Bus nicks are otherwise unauthenticated: anyone can post as any nick.
 # A nick claim is a lightweight defense: the first instance to use a nick
-# records its instance id at muse-bus:nickclaim:<nick> (SET NX, 5-minute
-# TTL, renewed by every presence_beat). A second instance using the same
-# nick sees the conflict via nick_conflict_holder() and warns instead of
-# silently sharing the identity.
+# records its instance id at muse-bus:nickclaim:<nick> (SET NX, TTL
+# matched to the presence heartbeat interval, renewed by every
+# presence_beat alongside the presence key). A second instance trying to
+# use a live (reserved, unexpired) nick is rejected: send.py refuses to
+# post as it, announce.py refuses to change announce mode for it, and
+# poll.py / watch.py warn instead of silently sharing the identity.
+# Unreserved nicks and the plain-text message protocol are unaffected.
 #
 # INSTANCE_ID defaults to the machine hostname, so one agent per machine
 # just works. Running two agents as the same nick on ONE machine needs
 # MUSE_RELAY_INSTANCE_ID set differently per agent.
 
 INSTANCE_ID = os.environ.get("MUSE_RELAY_INSTANCE_ID") or socket.gethostname()
-NICKCLAIM_TTL = 300  # seconds; renewed by presence_beat
+NICKCLAIM_TTL = PRESENCE_TTL  # reservation lives exactly as long as
+# presence: both are renewed by every presence_beat and lapse together.
 _CLAIM_CHECK_INTERVAL = 60  # seconds between claim checks
 _claim_state = {"checked": 0.0, "ok": None, "holder": None}
 
@@ -264,6 +268,23 @@ def nick_conflict_holder():
     if ok is False:
         return holder
     return None
+
+
+def nick_holders(nicks):
+    """Return {nick: holder-instance} for the nicks with a live claim.
+
+    Read-only batch version of nick_holder (one MGET); unclaimed nicks
+    are absent from the result. Used by presence.py to show who holds
+    which nick.
+    """
+    nicks = list(nicks)
+    if not nicks:
+        return {}
+    keys = "/".join(_nickclaim_key(n) for n in nicks)
+    data = json.loads(api_get(f"mget/{keys}"))
+    vals = data.get("result") or []
+    return {n: urllib.parse.unquote(v)
+            for n, v in zip(nicks, vals) if v}
 
 
 def _token():

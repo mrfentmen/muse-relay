@@ -103,15 +103,15 @@ class StatusCliTest(RelayTestCase):
         self.run_cli(send.main, ["--status", "heads down"])
         rc_, out, err = self.run_cli(presence.main, [])
         self.assertEqual(rc_, 0, err)
-        self.assertIn("tester (heads down)", out)
+        self.assertIn("tester [host-a] (heads down)", out)
 
     def test_presence_bare_nick_without_status(self):
         self.run_cli(send.main, ["--status", "brb"])
         self.run_cli(send.main, ["--status", ""])  # cleared
         rc_, out, err = self.run_cli(presence.main, [])
         self.assertEqual(rc_, 0, err)
-        self.assertIn("tester\n", out)
-        self.assertNotIn("tester (", out)
+        self.assertIn("tester [host-a]\n", out)
+        self.assertNotIn("(", out)
 
     def test_presence_expired_status_shows_bare_nick(self):
         self.run_cli(send.main, ["--status", "brb"])
@@ -119,7 +119,7 @@ class StatusCliTest(RelayTestCase):
         rc.presence_beat()  # nick comes back, no status left to renew
         rc_, out, err = self.run_cli(presence.main, [])
         self.assertEqual(rc_, 0, err)
-        self.assertIn("tester\n", out)
+        self.assertIn("tester [host-a]\n", out)
         self.assertNotIn("(", out)
 
     def test_status_survives_a_regular_send_beat(self):
