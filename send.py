@@ -464,6 +464,10 @@ def main(argv=None):
             return 2
         now = int(time.time())
         end = now + pomo_secs
+        # Post the start line first: no phantom timer/DONE without it.
+        rc = post_message(f"POMODORO {NICK} {pomo_secs} {label}", key)
+        if rc != 0:
+            return rc
         try:
             pomo_register(key, NICK, label, pomo_secs, end)
             schedule_message(end, key, f"POMODORO-DONE {NICK} {label}")
@@ -471,8 +475,7 @@ def main(argv=None):
             print(f"RELAY_ERROR: pomodoro schedule failed ({e})",
                   file=sys.stderr)
             return 2
-        beat()
-        return post_message(f"POMODORO {NICK} {pomo_secs} {label}", key)
+        return 0
 
     if args.desc is not None:
         try:

@@ -122,12 +122,12 @@ def main(argv=None):
         return 2
     try:
         if args.cmd == "set":
-            q = urllib.parse.quote(akey, safe="")
-            api_get(f"set/{q}/{urllib.parse.quote(NICK, safe='')}")
+            q = urllib.parse.quote(NICK, safe="")
+            api_get(f"set/{akey}/{q}")
             label = "main bus" if not room else f"#{room}"
             print(f"ANNOUNCE_SET {label} announcer={NICK}")
         else:  # clear
-            api_get(f"del/{urllib.parse.quote(akey, safe='')}")
+            api_get(f"del/{akey}")
             label = "main bus" if not room else f"#{room}"
             print(f"ANNOUNCE_CLEARED {label}")
     except Exception as e:
