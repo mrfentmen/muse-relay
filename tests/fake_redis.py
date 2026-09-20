@@ -146,6 +146,19 @@ class FakeUpstash:
                 stop = len(lst) + stop
             self.lists[a[0]] = lst[start:stop + 1]
             return "OK"
+        if cmd == "lrem":
+            # LREM key count value — count==0 removes all, >0 from the
+            # head, <0 from the tail. Returns the number removed.
+            key, count, value = a[0], int(a[1]), a[2]
+            lst = self.lists.get(key, [])
+            idxs = [i for i, v in enumerate(lst) if v == value]
+            if count > 0:
+                idxs = idxs[:count]
+            elif count < 0:
+                idxs = idxs[count:]
+            for i in sorted(idxs, reverse=True):
+                del lst[i]
+            return len(idxs)
         if cmd == "zadd":
             z = self.zsets.setdefault(a[0], {})
             z[a[2]] = float(a[1])

@@ -65,6 +65,7 @@ python3 send.py --ttl 5m "this burns soon"  # ephemeral message
 python3 send.py --blob ./notes.txt          # file attachment as BLOB: pointer
 python3 send.py --clip                      # push clipboard for paste.py on another machine
 python3 paste.py --stdout                   # pull your latest clip, raw bytes
+python3 forward.py 7 #news                  # repost message 7 into #news
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -344,14 +345,19 @@ python3 edits.py --dm s3cr3t dm-1a2b3c4d5e6f-2 "corrected"
 Only the original nick may edit its own message — anything else is
 rejected with a clear error (`message 1 was sent by 'milo'; only the
 original nick may edit it`), as is an unknown id (`no such message:
-42`). Max text length is enforced, same as send (`MUSE_RELAY_MAX_TEXT`,
-default 2000 chars — use `--blob` for long content). The edit is
+42`). The edit is
 applied to the local store, then announced on the bus as
 `<nick>: EDIT <id> <new text>`; `poll.py` and `watch.py` render
-incoming EDIT lines with an `(edited)` marker — and apply them to the
-local copy when the store knows the message (shared store dir, i.e.
+incoming EDIT lines with an `(edited)` marker — and apply them tothe local copy when the store knows the message (shared store dir, i.e.
 same machine). Spoofed edits (wrong nick on a known message) are
 rejected with a stderr warning and never applied.
+
+Since ids exist for what *you* sent, `poll.py` and `watch.py` also
+record incoming messages from other nicks in the room's store (your own
+lines are already there via send.py; EDIT protocol lines mutate instead
+of duplicating). That gives every locally-seen message an id usable by
+the id-based tools below — forward.py and saved.py — not just your own
+posts. Idempotent: a duplicate line never gets a second id.
 
 **Message ids** are `<room>-<counter>` — a bare counter on the main
 bus (`1`, `2`, ...), `build-x-3` in a room, `dm-<hash>-2` in a DM room
@@ -367,6 +373,35 @@ bus, `messages-<room>.jsonl` for rooms. Each line is one message:
 ```json
 {"id": "build-x-3", "room": "build-x", "nick": "milo", "text": "ship it monday", "ts": 1758300000, "edited": true, "edit_history": [{"text": "ship it friday", "ts": 1758299000}]}
 ```
+
+### Forwarding
+
+Repost a stored message into another room by its id:
+
+```bash
+python3 forward.py --room build-x build-x-3 #announce
+# -> tester: milo (via tester): ship it monday   (in #announce)
+python3 forward.py 7 #news          # id from the main bus, '#' optional
+python3 forward.py --dm s3cr3t dm-1a2b3c4d5e6f-2 #crew
+```
+
+The repost renders as `<original nick> (via <forwarder>): <text>` —
+authorship stays with the author, and the forwarder is on the record.
+The lookup goes through the source room's local store, so ids come from
+`MSG_ID` output or from poll/watch recording (above). **Forwarding a
+forwarded message keeps a single `(via …)` hop** — the original nick is
+preserved and no `a (via b (via c))` chains ever form. An unknown id is
+a clear error (`no such message: 99`); the target room is sanitized
+like any room name.
+
+The wire protocol is `FWD <id> <#room>`, and `forward.py` is the CLI
+that executes it (a bare `FWD` line on the bus renders as ordinary
+chatter; the CLI does the actual repost).
+
+Limitations, honestly: the store is local per machine, so you can only
+forward messages your machine has seen (your sends + what you polled or
+watched). `edit_history` is not carried along — the forward carries the
+current text.
 
 `edit_history` keeps each displaced text with the time it was replaced
 (`edit_history[0]` is the original). Writes are atomic — the file is
@@ -508,6 +543,7 @@ python3 send.py --mute spammer
 | `jobs.py` | Crew job queue: post/claim/heartbeat/progress/done/blocked/requeue/sweep |
 | `store.py` | Local per-room JSONL message store (ids, edit history) |
 | `edits.py` | Edit your own messages: `edits.py <id> <new text>` |
+| `forward.py` | Forward a stored message into another room (`FWD <id> #room`) |
 | `clipboard.py` | Local clipboard read/write with tool fallbacks (loud failures) |
 | `paste.py` | Pull your latest clip onto this machine's clipboard (`--stdout` for pipes) |
 | `bus.html` | Live web viewer (read-only, bring your own token) |
