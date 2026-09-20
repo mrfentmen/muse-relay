@@ -13,6 +13,7 @@ chmod 600. The token is never printed by any script.
 """
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -21,6 +22,29 @@ BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
 NICK = os.environ.get("MUSE_RELAY_NICK", "milo")
 TOKEN_FILE = os.path.expanduser(
     os.environ.get("MUSE_RELAY_TOKEN_FILE", "~/.config/muse-relay/token"))
+
+
+def clean_room(room):
+    """Sanitize a room name to [a-z0-9_-]; '' means the default room."""
+    clean = re.sub(r"[^a-z0-9_-]", "", (room or "").strip().lower())
+    if room and not clean:
+        raise ValueError(f"invalid room name: {room!r}")
+    return clean
+
+
+def bus_key(room=None):
+    """Redis key for a room. The default room is the legacy 'muse-bus' list,
+    so existing send/poll setups keep working unchanged."""
+    clean = clean_room(room)
+    return f"muse-bus:room:{clean}" if clean else BUS
+
+
+def seen_path(room=None):
+    """Read-offset file for a room, next to this module."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    clean = clean_room(room)
+    name = "seen.txt" if not clean else f"seen-{clean}.txt"
+    return os.path.join(here, name)
 
 
 def _token():
@@ -64,22 +88,23 @@ def api_get(path, retries=4):
     raise RuntimeError(f"request failed after {retries} attempts: {last_err}")
 
 
-def bus_get(start, stop):
-    """Return list items BUS[start..stop] as Python objects."""
-    data = json.loads(api_get(f"lrange/{BUS}/{start}/{stop}"))
+def bus_get(start, stop, key=None):
+    """Return list items key[start..stop] as Python objects."""
+    data = json.loads(api_get(f"lrange/{key or BUS}/{start}/{stop}"))
     return data.get("result", []) or []
 
 
-def bus_push(body):
+def bus_push(body, key=None):
     """Append a plain-text string to the bus; returns the raw response."""
     _check_config()
     token = _token()
+    key = key or BUS
     cmd = ["curl", "-s", "-m", "20",
            "-H", f"Authorization: Bearer {token}",
            "-H", "Content-Type: text/plain",
            "-H", "Connection: close",
            "--data-binary", "@-",
-           f"{RELAY_URL}/rpush/{BUS}"]
+           f"{RELAY_URL}/rpush/{key}"]
     last_err = "no attempts"
     for _ in range(4):
         try:
