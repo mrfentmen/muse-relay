@@ -171,6 +171,34 @@ class FakeUpstash:
             z = self.zsets.get(a[0], {})
             ordered = sorted(z, key=lambda m: (z[m], m))
             return ordered
+        if cmd == "zrangebyscore":
+            z = self.zsets.get(a[0], {})
+
+            def _score(s):
+                if s == "-inf":
+                    return float("-inf")
+                if s == "+inf":
+                    return float("inf")
+                return float(s)
+
+            lo, hi = _score(a[1]), _score(a[2])
+            return [m for m in sorted(z, key=lambda m: (z[m], m))
+                    if lo <= z[m] <= hi]
+        if cmd == "zremrangebyscore":
+            z = self.zsets.get(a[0], {})
+
+            def _score(s):
+                if s == "-inf":
+                    return float("-inf")
+                if s == "+inf":
+                    return float("inf")
+                return float(s)
+
+            lo, hi = _score(a[1]), _score(a[2])
+            doomed = [m for m in z if lo <= z[m] <= hi]
+            for m in doomed:
+                del z[m]
+            return len(doomed)
         if cmd == "ping":
             return "PONG"
         raise ValueError(f"fake: unknown command {cmd}")

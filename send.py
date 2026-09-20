@@ -72,7 +72,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
     bus_push, bus_trim, clean_room, clip_put, dm_room, img_put, mod_add,
-    mod_del, mute_add, mute_del, nick_conflict_holder, presence_beat,
+    mod_del, mute_add, mute_del, nick_conflict_holder, pomo_register,
+    presence_beat,
     recur_add, room_set_desc, room_touch, status_set, typing_ping)
 import clipboard  # noqa: E402
 import store  # noqa: E402
@@ -91,6 +92,31 @@ def parse_duration(spec):
         raise ValueError(
             f"not a duration (try 30s, 10m, 2h, 1d): {spec!r}")
     return int(m.group(1)) * _UNIT_SECS[m.group(2).lower()]
+
+
+_POMO_UNIT_RE = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
+
+
+def parse_pomodoro_duration(spec):
+    """'25m', '1h30m', '90s', '2h 15m' -> seconds. Rejects garbage."""
+    s = (spec or "").strip()
+    total, pos = 0, 0
+    for m in _POMO_UNIT_RE.finditer(s):
+        start = m.start()
+        while pos < start and s[pos].isspace():
+            pos += 1
+        if start != pos:
+            raise ValueError(
+                f"not a pomodoro duration (try 25m, 1h30m, 90s): "
+                f"{spec!r}")
+        total += int(m.group(1)) * _UNIT_SECS[m.group(2).lower()]
+        pos = m.end()
+    while pos < len(s) and s[pos].isspace():
+        pos += 1
+    if pos != len(s) or total <= 0:
+        raise ValueError(
+            f"not a pomodoro duration (try 25m, 1h30m, 90s): {spec!r}")
+    return total
 
 
 def parse_when(spec):
@@ -299,6 +325,12 @@ def main(argv=None):
                     help="recurring message, durations only, minimum 60s. "
                          "Posts nothing now; timecapsule.py delivers it "
                          "every DUR and reschedules")
+    ap.add_argument("--pomodoro", default=None, metavar="DUR",
+                    help="start a pomodoro timer: posts "
+                         "'POMODORO <nick> <secs> <label>' now and "
+                         "schedules 'POMODORO-DONE <nick> <label>' via "
+                         "timecapsule.py. Durations like 25m, 1h30m, 90s. "
+                         "The label is the message text.")
     ap.add_argument("--typing", action="store_true",
                     help="one-shot typing-indicator ping; posts nothing")
     ap.add_argument("--mod-add", default=None, metavar="NICK",
@@ -323,9 +355,10 @@ def main(argv=None):
     if args.at and args.ttl:
         print("ERROR: --at and --ttl don't combine", file=sys.stderr)
         return 2
-    if args.img and (args.at or args.ttl or args.every or args.blob):
-        print("ERROR: --img doesn't combine with --at/--ttl/--every/--blob",
-              file=sys.stderr)
+    if args.img and (args.at or args.ttl or args.every or args.blob
+                      or args.pomodoro):
+        print("ERROR: --img doesn't combine with --at/--ttl/--every/--blob/"
+              "--pomodoro", file=sys.stderr)
         return 2
     if args.clip and (args.at or args.ttl or args.every or args.blob
                       or args.img or args.mute or args.unmute
@@ -340,6 +373,11 @@ def main(argv=None):
         print("ERROR: --every doesn't combine with --at/--ttl/--blob/--img",
               file=sys.stderr)
         return 2
+    if args.pomodoro and (args.at or args.ttl or args.every or args.blob
+                          or args.img):
+        print("ERROR: --pomodoro doesn't combine with --at/--ttl/--every/"
+              "--blob/--img", file=sys.stderr)
+        return 2
     if args.img and (args.mute or args.unmute or args.topic is not None):
         print("ERROR: --img doesn't combine with --mute/--unmute/--topic",
               file=sys.stderr)
@@ -347,11 +385,11 @@ def main(argv=None):
     ops = [bool(args.every), bool(args.typing), args.desc is not None,
            bool(args.mod_add), bool(args.mod_del),
            bool(args.mute), bool(args.unmute), args.topic is not None,
-           args.status is not None]
+           args.status is not None, bool(args.pomodoro)]
     if sum(ops) > 1:
         print("ERROR: only one of --every/--typing/--desc/--mod-add/"
-              "--mod-del/--mute/--unmute/--topic/--status per invocation",
-              file=sys.stderr)
+              "--mod-del/--mute/--unmute/--topic/--status/--pomodoro per "
+              "invocation", file=sys.stderr)
         return 2
     if ((args.mute or args.unmute or args.topic is not None
          or args.status is not None) and args.message):
@@ -412,6 +450,29 @@ def main(argv=None):
         when_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
         print(f"RECURRING_EVERY {every_secs}s NEXT {when} ({when_s})")
         return 0
+
+    if args.pomodoro:
+        try:
+            pomo_secs = parse_pomodoro_duration(args.pomodoro)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        label = args.message.strip() if args.message else ""
+        if not label:
+            print("ERROR: --pomodoro needs a label (the message text)",
+                  file=sys.stderr)
+            return 2
+        now = int(time.time())
+        end = now + pomo_secs
+        try:
+            pomo_register(key, NICK, label, pomo_secs, end)
+            schedule_message(end, key, f"POMODORO-DONE {NICK} {label}")
+        except Exception as e:
+            print(f"RELAY_ERROR: pomodoro schedule failed ({e})",
+                  file=sys.stderr)
+            return 2
+        beat()
+        return post_message(f"POMODORO {NICK} {pomo_secs} {label}", key)
 
     if args.desc is not None:
         try:

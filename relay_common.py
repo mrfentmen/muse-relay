@@ -499,7 +499,72 @@ def clip_history(nick=None):
 
 RECUR_KEY = "muse-bus:recur"
 ROOMDIR_KEY = "muse-bus:roomdir"
+POMO_KEY = "muse-bus:pomodoros"
 TYPING_TTL = 10  # seconds a typing indicator stays live
+
+
+def fmt_remaining(secs):
+    """'1500' -> '25m', '5430' -> '1h 30m 30s', '45' -> '45s'."""
+    secs = max(0, int(secs))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s or not parts:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def pomo_register(roomkey, nick, label, secs, end):
+    """Register a pomodoro timer; poll.py renders it with remaining time.
+
+    Member JSON {"nick","label","room","secs","end"} scored at the end
+    unix timestamp. Returns nothing; raises on transport failure.
+    """
+    member = json.dumps({"nick": nick, "label": label, "room": roomkey,
+                         "secs": int(secs), "end": int(end)},
+                        separators=(",", ":"))
+    q = urllib.parse.quote(member, safe="")
+    api_get(f"zadd/{POMO_KEY}/{int(end)}/{q}")
+
+
+def pomo_active(roomkey, now=None):
+    """Active pomodoro timers for a room bus key.
+
+    Returns [{"nick","label","remaining"}] with remaining in seconds,
+    soonest-ending first. Prunes expired timers. Never raises — an
+    unreadable timer registry just yields no timers.
+    """
+    now = int(time.time() if now is None else now)
+    try:
+        api_get(f"zremrangebyscore/{POMO_KEY}/0/{now}")
+    except Exception:
+        pass
+    try:
+        data = json.loads(api_get(f"zrangebyscore/{POMO_KEY}/{now}/+inf"))
+    except Exception:
+        return []
+    out = []
+    for m in data.get("result") or []:
+        try:
+            item = json.loads(m)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(item, dict) or item.get("room") != roomkey:
+            continue
+        end = item.get("end")
+        if not isinstance(end, (int, float)):
+            continue
+        rem = int(end) - now
+        if rem > 0:
+            out.append({"nick": item.get("nick", "?"),
+                        "label": item.get("label", ""),
+                        "remaining": rem})
+    out.sort(key=lambda t: t["remaining"])
+    return out
 
 
 def typing_ping(roomkey, nick):

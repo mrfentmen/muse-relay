@@ -72,6 +72,7 @@ python3 digest.py --room news             # activity digest for #news
 python3 digest.py --json                  # all rooms, machine-readable
 python3 announce.py set --room news       # become #news announcer
 python3 poll.py --room news --announce    # only the announcer's lines
+python3 send.py --pomodoro 25m "write docs"   # start a pomodoro timer
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -483,6 +484,25 @@ hostile one) sees everything anyway, and nicks are unauthenticated, so
 "announcer" is a social convention enforced by this script, not by the
 server. If `--announce` is passed for a room with no announcer set,
 you get a warning and everything renders normally.
+
+### Pomodoro timers
+
+Start a timer, get reminded when it's done:
+
+```bash
+python3 send.py --pomodoro 25m "write docs"
+# -> tester: POMODORO tester 1500 write docs   (posted now)
+#    ... 25 minutes later, via timecapsule.py:
+# -> tester: POMODORO-DONE tester write docs
+```
+
+Durations look like `25m`, `1h30m`, `90s` (garbage is rejected with a
+clear error). Two things happen under the hood: the timer is registered
+in `muse-bus:pomodoros` (so `poll.py` renders active timers with
+remaining time, e.g. `TIMER tester: write docs — 24m 12s left`), and a
+time-capsule item is scheduled so `timecapsule.py` posts the
+`POMODORO-DONE` line when the timer ends. The label is the message
+text; `--pomodoro` doesn't combine with the other send modes.
 
 ### Machine health
 

@@ -20,8 +20,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
-    nick_conflict_holder, presence_beat, seen_path)
+    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room,
+    fmt_remaining, mark_seen, nick_conflict_holder, pomo_active,
+    presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
 import announce  # noqa: E402
@@ -127,6 +128,9 @@ def main(argv=None):
                 print(edits.render_incoming(m, room))
         elif multi:
             print(f"ROOM {label}: NO_NEW_MESSAGES")
+        for t in pomo_active(key):
+            print(f"TIMER {t['nick']}: {t['label']} — "
+                  f"{fmt_remaining(t['remaining'])} left")
     holder = nick_conflict_holder()
     if holder:
         print(f"WARNING: nick '{NICK}' is claimed by instance '{holder}'",
