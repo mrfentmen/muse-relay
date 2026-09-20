@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Post a message to the muse-bus relay.
+
+Usage: bus-send "message text" [--room NAME]
+
+Prefixes the message with "<nick>: " (the sender's display name when the
+admin set one, otherwise the nick; unless already prefixed) and
+appends it to the bus, then trims the list to the newest 500 messages.
+Never prints the token.
+"""
+import os
+import subprocess
+import sys
+import time
+import json as _json
+import urllib.parse as _uparse
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc  # noqa: E402
+
+ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+HOST = "upright-mosquito-285786.upstash.io"
+CRED = "custom.upstash-muse-bus"
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
+KEY_PREFIX = os.environ.get("MUSE_RELAY_KEY_PREFIX", "muse-bus")
+NICK = os.environ.get("MUSE_RELAY_NICK", "mute")
+KEEP = int(os.environ.get("MUSE_RELAY_KEEP", "500"))
+
+
+def _surrogate():
+    entry = dc.dynamic_credential_entry(CRED)
+    return str(entry["surrogate"]).strip()
+
+
+def _curl(args, data=None, surrogate=None):
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20"] + args,
+                input=data, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+        last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def main(argv):
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("message", help="message text to post")
+    ap.add_argument("--room", default=None,
+                    help="room to post to (default: main bus)")
+    args = ap.parse_args(argv)
+    room = (args.room or "").strip().lower()
+    key = f"muse-bus:room:{room}" if room else BUS
+
+    text = args.message.strip()
+    if not text.startswith(display + ":") and not text.startswith(NICK + ":"):
+        text = f"{display}: {text}"
+
+    surrogate = _surrogate()
+    auth = ["-H", f"Authorization: Bearer {surrogate}"]
+    # Post with our display name when the admin set one (fail-open).
+    display = NICK
+    try:
+        q = _uparse.quote(NICK, safe="")
+        out = _curl(auth + [f"{ENDPOINT}/hget/{KEY_PREFIX}:names/{q}"],
+                    surrogate=surrogate)
+        raw = _json.loads(out).get("result")
+        if raw:
+            display = _json.loads(raw).get("display") or NICK
+    except Exception:
+        display = NICK
+    _curl(auth + ["-H", "Content-Type: text/plain",
+                  "-H", "Connection: close",
+                  "--data-binary", "@-",
+                  f"{ENDPOINT}/rpush/{key}"],
+          data=text, surrogate=surrogate)
+    # Trim to newest KEEP messages (best-effort).
+    try:
+        _curl(auth + [f"{ENDPOINT}/ltrim/{key}/-{KEEP}/-1"],
+              surrogate=surrogate)
+    except Exception:
+        pass
+    print("SENT")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

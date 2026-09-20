@@ -287,6 +287,57 @@ def nick_holders(nicks):
             for n, v in zip(nicks, vals) if v}
 
 
+# --- Display names: admin-settable renames ---------------------------------
+#
+# rename (<nick> -> <display>) is an admin-only operation (see admin.py).
+# The canonical nick stays the identity key for claims, mods, admins, and
+# presence; the display name is what writers put in the message prefix and
+# what readers show. All lookups are fail-open: on any Redis failure the
+# display name is the nick itself, so a names-registry outage never breaks
+# the bus.
+
+def key_prefix():
+    """Redis key prefix; overridable for tests (MUSE_RELAY_KEY_PREFIX)."""
+    return os.environ.get("MUSE_RELAY_KEY_PREFIX", "muse-bus")
+
+
+def display_name(nick=None):
+    """Display name for a nick, or the nick itself when unset/on error."""
+    nick = nick or NICK
+    try:
+        q = urllib.parse.quote(nick, safe="")
+        data = json.loads(api_get(f"hget/{key_prefix()}:names/{q}"))
+        raw = data.get("result")
+        if raw:
+            return json.loads(raw).get("display") or nick
+    except Exception:
+        pass
+    return nick
+
+
+_display_cache = {"at": 0.0, "nick": None, "prefixes": None}
+_DISPLAY_CACHE_TTL = 60  # seconds
+
+
+def own_prefixes():
+    """Message prefixes that count as 'me': canonical nick + own display.
+
+    Cached briefly per nick; a rename takes at most a minute to be noticed
+    by a long-running watcher.
+    """
+    now = time.time()
+    c = _display_cache
+    if (c["prefixes"] is not None and c["nick"] == NICK
+            and now - c["at"] < _DISPLAY_CACHE_TTL):
+        return c["prefixes"]
+    prefixes = {NICK}
+    d = display_name(NICK)
+    if d:
+        prefixes.add(d)
+    c["at"], c["nick"], c["prefixes"] = now, NICK, prefixes
+    return prefixes
+
+
 def _token():
     with open(TOKEN_FILE) as f:
         token = f.read().strip()

@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room,
-    fmt_remaining, mark_seen, nick_conflict_holder, pomo_active,
+    fmt_remaining, mark_seen, nick_conflict_holder, own_prefixes, pomo_active,
     presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
@@ -55,8 +55,10 @@ def poll_one(key, seen_file):
         presence_beat(key)
     except Exception as e:
         log_error(f"presence heartbeat failed: {e}")
+    mine = own_prefixes()  # canonical nick + own display name
     new = [m for m in msgs
-           if isinstance(m, str) and not m.startswith(NICK + ":")]
+           if isinstance(m, str)
+           and not any(m.startswith(p + ":") for p in mine)]
     try:
         st = store.open_store(store.room_for_key(key))
         for m in new:

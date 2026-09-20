@@ -26,7 +26,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
-    nick_conflict_holder, presence_beat, seen_path)
+    nick_conflict_holder, own_prefixes, presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
 import announce  # noqa: E402
@@ -82,8 +82,10 @@ def watch_once(targets, announce_only=False):
                           f"line(s) in {label} (--announce)",
                           file=sys.stderr)
                 msgs = kept
+        mine = own_prefixes()  # canonical nick + own display name
         for m in msgs:
-            if isinstance(m, str) and not m.startswith(NICK + ":"):
+            if isinstance(m, str) and not any(
+                    m.startswith(p + ":") for p in mine):
                 print(edits.render_incoming(m, store.room_for_key(key)),
                       flush=True)
                 shown += 1

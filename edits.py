@@ -79,6 +79,12 @@ def record_incoming(st, line, my_nick):
         return None
     if nick == my_nick:
         return None
+    try:
+        import relay_common as rc
+        if my_nick == rc.NICK and nick in rc.own_prefixes():
+            return None  # own line under our display name
+    except Exception:
+        pass
     if parse_edit_text(text):
         return None
     try:
