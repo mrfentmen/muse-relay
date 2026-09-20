@@ -60,6 +60,11 @@ out.parsedNull = parseNames(null);
 out.parsedUndef = parseNames(undefined);
 out.label1 = labelFor({alice: "Alice Cooper"}, "alice");
 out.label2 = labelFor({}, "alice");
+out.isAdmin1 = isAdmin(["Mrfentmen", "del", "mute"], "mrfentmen");
+out.isAdmin2 = isAdmin(["Mrfentmen", "del", "mute"], "MRFENTMEN");
+out.isAdmin3 = isAdmin(["Mrfentmen", "del", "mute"], "Mrfentmen");
+out.isAdmin4 = isAdmin(["Mrfentmen", "del", "mute"], "bob");
+out.isAdmin5 = isAdmin([], "mrfentmen");
 console.log(JSON.stringify(out));
 """
 
@@ -156,6 +161,14 @@ class BusRenameInterop(unittest.TestCase):
     def test_label_for(self):
         self.assertEqual(self.js["label1"], "Alice Cooper")
         self.assertEqual(self.js["label2"], "alice")
+
+    def test_is_admin_case_insensitive(self):
+        # the exact failure the boss hit: "mrfentmen" vs admin "Mrfentmen"
+        self.assertTrue(self.js["isAdmin1"])
+        self.assertTrue(self.js["isAdmin2"])
+        self.assertTrue(self.js["isAdmin3"])
+        self.assertFalse(self.js["isAdmin4"])
+        self.assertFalse(self.js["isAdmin5"])
 
 
 class BusRenameWiring(unittest.TestCase):

@@ -2622,6 +2622,15 @@ try {
   function labelFor(cache, nick) {
     return (cache && cache[nick]) || nick;
   }
+  /* Admin membership check — case-insensitive, so "mrfentmen"
+     matches an admin entry of "Mrfentmen". */
+  function isAdmin(admins, actor) {
+    var want = String(actor).toLowerCase();
+    for (var i = 0; i < admins.length; i++) {
+      if (String(admins[i]).toLowerCase() === want) return true;
+    }
+    return false;
+  }
   /*__SIGNING_END__*/
 
   function el(id) { return U.el(id); }
@@ -2788,7 +2797,7 @@ try {
     try {
       setMsg("checking admin…", "");
       var a = await U.api("/smembers/" + ADMIN_PREFIX + ":admins");
-      if ((a.result || []).indexOf(actor) === -1) {
+      if (!isAdmin(a.result || [], actor)) {
         throw new Error("nick '" + actor + "' is not an admin");
       }
       setMsg("writing…", "");
