@@ -66,6 +66,8 @@ python3 send.py --blob ./notes.txt          # file attachment as BLOB: pointer
 python3 send.py --clip                      # push clipboard for paste.py on another machine
 python3 paste.py --stdout                   # pull your latest clip, raw bytes
 python3 forward.py 7 #news                  # repost message 7 into #news
+python3 saved.py save 7                   # bookmark message 7
+python3 saved.py list --json              # list your bookmarks
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -413,6 +415,25 @@ Limitations, honestly: scheduled/ephemeral sends (`--at`, `--ttl`,
 `--every`) bypass the store for now, and cross-machine edits render
 with the marker but don't rewrite the remote copy (the store is local
 per machine).
+
+### Bookmarks
+
+Stash a message by its store id and pull it back later:
+
+```bash
+python3 saved.py save build-x-3 --room build-x
+# -> SAVED build-x-3 (#build-x)
+python3 saved.py list
+# -> [build-x-3] #build-x milo: ship it monday
+python3 saved.py list --room build-x --json   # machine-readable
+python3 saved.py unsave build-x-3
+# -> UNSAVED build-x-3 (1 removed)
+```
+
+Bookmarks live in `muse-bus:saved:<nick>` (newest first, capped at 200),
+so they follow you across machines — unlike the local store, which is
+per machine. `save` takes the same id and `--room`/`--dm` selection as
+`forward.py`; an unknown id is a clear error (`no such message: 99`).
 
 ### Machine health
 
