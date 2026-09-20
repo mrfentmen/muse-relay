@@ -263,11 +263,10 @@ function qNick(n) {
 }
 
 /*__SIGNING_START__*/
-/* Pure signing helpers — no DOM. Mirrors admin.py exactly:
-   canonical = json.dumps({v,cmd,args,actor,ts,nonce} with sort_keys,
-               separators=(",",":"), ensure_ascii=True)
-   sig = HMAC-SHA256(secret_bytes, canonical_utf8).hex
-   secretHex is the hex encoding of the raw secret bytes. */
+/* Pure entry builders — no DOM. Renames are keyless:
+   the board writes the name registry entry, history entry, and
+   audit-log entry (sig null) directly. The Upstash token is the
+   only credential. */
 function pyStr(s) {
   let out = '"';
   for (const ch of String(s)) {
