@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muse-relay — live bus</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0d1117; color: #c9d1d9;
+    font: 14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 10px 14px; border-bottom: 1px solid #21262d;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: #010409;
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  header input {
+    background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+    border-radius: 6px; padding: 5px 9px; font-size: 13px;
+  }
+  header input[type=text]:first-of-type { width: 280px; }
+  header input[type=password] { width: 220px; }
+  header input.room { width: 110px; }
+  button {
+    background: #238636; border: 1px solid rgba(240,246,252,.1); color: #fff;
+    border-radius: 6px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #30363d; cursor: default; }
+  #status { font-size: 12px; color: #8b949e; }
+  #status.live { color: #3fb950; }
+  #status.err { color: #f85149; }
+  #presence {
+    padding: 6px 14px; border-bottom: 1px solid #21262d; font-size: 12px;
+    color: #8b949e; background: #010409; min-height: 30px;
+  }
+  #presence .who {
+    display: inline-block; margin-right: 8px; padding: 1px 8px;
+    border: 1px solid #30363d; border-radius: 12px; color: #c9d1d9;
+  }
+  #presence .dot { color: #3fb950; margin-right: 4px; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 14px; }
+  .msg { padding: 4px 0; border-bottom: 1px solid #161b22; overflow-wrap: anywhere; }
+  .msg .nick { font-weight: 700; margin-right: 8px; }
+  .msg .at { color: #6e7681; font-size: 11px; margin-left: 8px; }
+  #hint {
+    margin: auto; max-width: 560px; color: #8b949e; text-align: center;
+    padding: 20px;
+  }
+  #hint code { color: #c9d1d9; }
+</style>
+</head>
+<body>
+<header>
+  <h1>muse-relay</h1>
+  <input id="url" type="text" placeholder="https://…upstash.io" autocomplete="off">
+  <input id="token" type="password" placeholder="REST token" autocomplete="off">
+  <input id="room" class="room" type="text" placeholder="room (blank = main)">
+  <button id="go">Connect</button>
+  <span id="status">not connected</span>
+</header>
+<div id="presence" hidden></div>
+<div id="log"><div id="hint">
+  Enter your Upstash <code>REST URL</code> and <code>REST token</code> to watch
+  the bus live. They are kept in this browser's <code>localStorage</code> only —
+  nothing is sent anywhere except your Upstash instance, and nothing is
+  committed to the repo. This page is read-only: it never posts.
+</div></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const log = $("log"), statusEl = $("status"), presenceEl = $("presence");
+let timer = null, seen = 0, pollInFlight = false;
+const nickColors = {};
+
+function nickColor(nick) {
+  if (!nickColors[nick]) {
+    let h = 0;
+    for (const c of nick) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    nickColors[nick] = "hsl(" + (h % 360) + ", 60%, 65%)";
+  }
+  return nickColors[nick];
+}
+
+function esc(s) {
+  return s.replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
+}
+
+async function api(path) {
+  const url = $("url").value.replace(/\/+$/, "");
+  const res = await fetch(url + path, {
+    headers: { "Authorization": "Bearer " + $("token").value }
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+function busKey() {
+  const room = $("room").value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return room ? "muse-bus:room:" + room : "muse-bus";
+}
+
+function renderPresence(nicks) {
+  presenceEl.hidden = false;
+  presenceEl.innerHTML = nicks.length
+    ? "online: " + nicks.map(n =>
+        '<span class="who"><span class="dot">●</span>' + esc(n) + "</span>").join("")
+    : "online: —";
+}
+
+async function pollPresence() {
+  try {
+    const sm = await api("/smembers/muse-bus:nicks");
+    const nicks = (sm.result || []).filter(n => typeof n === "string");
+    if (!nicks.length) { renderPresence([]); return; }
+    const mg = await api("/mget/" + nicks.map(n =>
+      "muse-bus:presence:" + encodeURIComponent(n)).join("/"));
+    renderPresence(nicks.filter((_, i) => mg.result && mg.result[i] != null));
+  } catch (e) { /* presence is best-effort; the log matters more */ }
+}
+
+async function poll() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const data = await api("/lrange/" + busKey() + "/" + seen + "/-1");
+    const msgs = data.result || [];
+    const hint = $("hint");
+    if (hint && (msgs.length || seen)) hint.remove();
+    for (const m of msgs) {
+      if (typeof m !== "string") continue;
+      const i = m.indexOf(":");
+      const nick = i > 0 ? m.slice(0, i).trim() : "?";
+      const text = i > 0 ? m.slice(i + 1).trim() : m;
+      const div = document.createElement("div");
+      div.className = "msg";
+      const at = new Date().toLocaleTimeString();
+      div.innerHTML = '<span class="nick" style="color:' + nickColor(nick) + '">' +
+        esc(nick) + "</span><span>" + esc(text) + '</span><span class="at">' +
+        esc(at) + "</span>";
+      log.appendChild(div);
+    }
+    if (msgs.length) {
+      seen += msgs.length;
+      log.scrollTop = log.scrollHeight;
+    }
+    setStatus("live — " + busKey(), "live");
+  } catch (e) {
+    setStatus("error: " + e.message, "err");
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+$("go").addEventListener("click", () => {
+  if (!$("url").value.trim() || !$("token").value) {
+    setStatus("enter the REST URL and token first", "err");
+    return;
+  }
+  try {
+    localStorage.setItem("relay-url", $("url").value.trim());
+    localStorage.setItem("relay-token", $("token").value);
+    localStorage.setItem("relay-room", $("room").value.trim());
+  } catch (e) { /* private mode etc. — just don't persist */ }
+  if (timer) clearInterval(timer);
+  seen = 0;
+  log.innerHTML = "";
+  setStatus("connecting…");
+  poll();
+  pollPresence();
+  timer = setInterval(() => { poll(); pollPresence(); }, 2000);
+  $("go").textContent = "Reconnect";
+});
+
+// restore previous settings
+try {
+  $("url").value = localStorage.getItem("relay-url") || "";
+  $("token").value = localStorage.getItem("relay-token") || "";
+  $("room").value = localStorage.getItem("relay-room") || "";
+} catch (e) {}
+</script>
+</body>
+</html>
