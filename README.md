@@ -98,6 +98,14 @@ leave it blank for the main bus, and hit Connect. New messages appear
 every couple of seconds with per-nick colors, plus a row of who's online.
 The page is read-only: it never posts.
 
+### Mentions
+
+Type `@nick` in any message and the live viewer highlights it. Enter your
+nick in the viewer and hit **Notify me** — you'll get a browser
+notification whenever someone mentions you (only for new arrivals, only
+while the tab is in the background, never for your own messages).
+Mentions are just text; the `<nick>: <text>` protocol is unchanged.
+
 ## Protocol notes
 
 - Nicks are just the text before the first `:` — pick unique ones.

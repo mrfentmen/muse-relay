@@ -47,6 +47,14 @@
   .msg { padding: 4px 0; border-bottom: 1px solid #161b22; overflow-wrap: anywhere; }
   .msg .nick { font-weight: 700; margin-right: 8px; }
   .msg .at { color: #6e7681; font-size: 11px; margin-left: 8px; }
+  .mention {
+    background: rgba(31,111,235,.18); border: 1px solid rgba(31,111,235,.45);
+    border-radius: 4px; padding: 0 3px; font-weight: 600; white-space: nowrap;
+  }
+  .mention.self { background: #9e6a03; border-color: #d29922; color: #fff; }
+  .msg.mentions-you {
+    background: #161b22; border-left: 2px solid #d29922; padding-left: 10px;
+  }
   #hint {
     margin: auto; max-width: 560px; color: #8b949e; text-align: center;
     padding: 20px;
@@ -60,7 +68,9 @@
   <input id="url" type="text" placeholder="https://…upstash.io" autocomplete="off">
   <input id="token" type="password" placeholder="REST token" autocomplete="off">
   <input id="room" class="room" type="text" placeholder="room (blank = main)">
+  <input id="mynick" class="room" type="text" placeholder="your nick">
   <button id="go">Connect</button>
+  <button id="notifyBtn" title="Get a browser notification when someone @-mentions your nick">Notify me</button>
   <span id="status">not connected</span>
 </header>
 <div id="presence" hidden></div>
@@ -75,7 +85,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const log = $("log"), statusEl = $("status"), presenceEl = $("presence");
-let timer = null, seen = 0, pollInFlight = false;
+let timer = null, seen = 0, pollInFlight = false, primed = false;
 const nickColors = {};
 
 function nickColor(nick) {
@@ -90,6 +100,43 @@ function nickColor(nick) {
 function esc(s) {
   return s.replace(/[&<>"']/g, c =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// Mentions: @nick highlights, with a stronger style when it's you.
+// Runs on already-escaped text — nick chars ([A-Za-z0-9_-]) are
+// escape-proof, so highlighting can't break the escaping. The lookbehind
+// keeps email-like text (a@b.com) from matching.
+const MENTION_RE = /(?<![A-Za-z0-9_-])@([A-Za-z0-9_-]+)/g;
+
+function myNick() {
+  return $("mynick").value.trim().toLowerCase();
+}
+
+function highlightMentions(escapedText) {
+  const self = myNick();
+  let mentionsYou = false;
+  const html = escapedText.replace(MENTION_RE, (m, nick) => {
+    const isSelf = !!self && nick.toLowerCase() === self;
+    if (isSelf) mentionsYou = true;
+    return '<span class="mention' + (isSelf ? ' self' : '') + '">@' +
+      nick + '</span>';
+  });
+  return { html, mentionsYou };
+}
+
+function maybeNotify(fromNick, text) {
+  // Only for fresh arrivals (primed), only when the tab is hidden, and
+  // never for your own messages.
+  try {
+    if (!primed || !document.hidden) return;
+    if (fromNick.toLowerCase() === myNick()) return;
+    if (!("Notification" in window)) return;
+    if (Notification.permission !== "granted") return;
+    new Notification("muse-relay: " + fromNick + " mentioned you", {
+      body: text.length > 200 ? text.slice(0, 200) + "…" : text,
+      tag: "muse-relay-mention"
+    });
+  } catch (e) { /* notifications are best-effort */ }
 }
 
 function setStatus(text, cls) {
@@ -143,18 +190,21 @@ async function poll() {
       const i = m.indexOf(":");
       const nick = i > 0 ? m.slice(0, i).trim() : "?";
       const text = i > 0 ? m.slice(i + 1).trim() : m;
+      const hl = highlightMentions(esc(text));
       const div = document.createElement("div");
-      div.className = "msg";
+      div.className = "msg" + (hl.mentionsYou ? " mentions-you" : "");
       const at = new Date().toLocaleTimeString();
       div.innerHTML = '<span class="nick" style="color:' + nickColor(nick) + '">' +
-        esc(nick) + "</span><span>" + esc(text) + '</span><span class="at">' +
+        esc(nick) + "</span><span>" + hl.html + '</span><span class="at">' +
         esc(at) + "</span>";
       log.appendChild(div);
+      if (hl.mentionsYou) maybeNotify(nick, text);
     }
     if (msgs.length) {
       seen += msgs.length;
       log.scrollTop = log.scrollHeight;
     }
+    primed = true;  // history loaded — notify only for new arrivals
     setStatus("live — " + busKey(), "live");
   } catch (e) {
     setStatus("error: " + e.message, "err");
@@ -172,9 +222,11 @@ $("go").addEventListener("click", () => {
     localStorage.setItem("relay-url", $("url").value.trim());
     localStorage.setItem("relay-token", $("token").value);
     localStorage.setItem("relay-room", $("room").value.trim());
+    localStorage.setItem("relay-mynick", $("mynick").value.trim());
   } catch (e) { /* private mode etc. — just don't persist */ }
   if (timer) clearInterval(timer);
   seen = 0;
+  primed = false;  // don't notify for the backlog we're about to load
   log.innerHTML = "";
   setStatus("connecting…");
   poll();
@@ -183,11 +235,48 @@ $("go").addEventListener("click", () => {
   $("go").textContent = "Reconnect";
 });
 
+function refreshNotifyBtn() {
+  const b = $("notifyBtn");
+  if (!("Notification" in window)) {
+    b.disabled = true;
+    b.textContent = "No notifications";
+    return;
+  }
+  if (Notification.permission === "granted") {
+    b.disabled = true;
+    b.textContent = "Notifications on";
+  } else if (Notification.permission === "denied") {
+    b.disabled = true;
+    b.textContent = "Notifications blocked";
+  } else {
+    b.disabled = false;
+    b.textContent = "Notify me";
+  }
+}
+
+$("notifyBtn").addEventListener("click", async () => {
+  if (!myNick()) {
+    setStatus("enter your nick first so we know what to watch for", "err");
+    $("mynick").focus();
+    return;
+  }
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm === "granted") setStatus("live — " + busKey(), "live");
+    else setStatus("notifications not granted", "err");
+  } catch (e) {
+    setStatus("notifications unavailable: " + e.message, "err");
+  }
+  refreshNotifyBtn();
+});
+refreshNotifyBtn();
+
 // restore previous settings
 try {
   $("url").value = localStorage.getItem("relay-url") || "";
   $("token").value = localStorage.getItem("relay-token") || "";
   $("room").value = localStorage.getItem("relay-room") || "";
+  $("mynick").value = localStorage.getItem("relay-mynick") || "";
 } catch (e) {}
 </script>
 </body>
