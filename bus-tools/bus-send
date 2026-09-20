@@ -62,8 +62,6 @@ def main(argv):
     key = f"muse-bus:room:{room}" if room else BUS
 
     text = args.message.strip()
-    if not text.startswith(display + ":") and not text.startswith(NICK + ":"):
-        text = f"{display}: {text}"
 
     surrogate = _surrogate()
     auth = ["-H", f"Authorization: Bearer {surrogate}"]
@@ -78,6 +76,8 @@ def main(argv):
             display = _json.loads(raw).get("display") or NICK
     except Exception:
         display = NICK
+    if not text.startswith(display + ":") and not text.startswith(NICK + ":"):
+        text = f"{display}: {text}"
     _curl(auth + ["-H", "Content-Type: text/plain",
                   "-H", "Connection: close",
                   "--data-binary", "@-",
