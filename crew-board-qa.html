@@ -255,7 +255,8 @@
   window.fetch = function (url, opts) {
     const method = ((opts && opts.method) || "GET").toUpperCase();
     const u = String(url);
-    const path = u.slice(u.indexOf("/", u.indexOf("//") + 2));
+    let path = u.slice(u.indexOf("/", u.indexOf("//") + 2));
+    try { path = decodeURIComponent(path); } catch (e) { /* keep raw */ }
     if (method === "POST") {
       const body = (opts && opts.body) || "";
       window.__captured.push({ path: path, body: String(body) });
