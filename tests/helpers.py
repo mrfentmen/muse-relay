@@ -14,6 +14,8 @@ import jobs  # noqa: E402
 import send  # noqa: E402
 import poll  # noqa: E402
 import watch  # noqa: E402
+import edits  # noqa: E402
+import store  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 
@@ -31,7 +33,7 @@ class RelayTestCase(unittest.TestCase):
         self.addCleanup(self._stop)
         # consumers did `from relay_common import api_get/...`: patch the
         # names in their namespaces too, not just relay_common's.
-        for mod in (jobs, send, poll, watch):
+        for mod in (jobs, send, poll, watch, edits):
             for name in ("api_get", "api_post", "bus_push"):
                 if hasattr(mod, name):
                     p = mock.patch.object(mod, name,
@@ -40,7 +42,7 @@ class RelayTestCase(unittest.TestCase):
                     self.addCleanup(p.stop)
         rc._claim_state.update(checked=0.0, ok=None, holder=None)
         self.tmp = tempfile.mkdtemp(prefix="relay-test-")
-        # seen files go to tmp, not the repo dir
+        # seen files and message stores go to tmp, not the repo dir
         self._seen_patches = [
             mock.patch.object(poll, "seen_path",
                               lambda room: os.path.join(
@@ -48,6 +50,11 @@ class RelayTestCase(unittest.TestCase):
             mock.patch.object(watch, "seen_path",
                               lambda room: os.path.join(
                                   self.tmp, "wseen-" + (room or "main"))),
+            mock.patch.object(
+                store, "store_path",
+                lambda room: os.path.join(
+                    self.tmp, "messages.jsonl" if not room
+                    else "messages-" + room + ".jsonl")),
         ]
         for p in self._seen_patches:
             p.start()
@@ -68,6 +75,7 @@ class RelayTestCase(unittest.TestCase):
         send.NICK = nick
         poll.NICK = nick
         watch.NICK = nick
+        edits.NICK = nick
         rc._claim_state.update(checked=0.0, ok=None, holder=None)
 
     def run_cli(self, mod_main, argv, stdin=None):

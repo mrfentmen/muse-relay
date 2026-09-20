@@ -273,6 +273,58 @@ python3 jobs.py sweep
 Dead workers are self-healing: if one disappears mid-job, its lease
 expires and `sweep` (or the next claim) hands the work back out.
 
+### Editable messages
+
+Every immediate `send.py` post is recorded in a local message store and
+gets an id, printed as `MSG_ID <id>`. Edit your own message with
+`edits.py`:
+
+```bash
+python3 send.py "ship it friday"
+# ... MSG_ID 1
+python3 edits.py 1 "ship it monday"
+python3 edits.py --room build-x build-x-3 "updated text"
+python3 edits.py --dm s3cr3t dm-1a2b3c4d5e6f-2 "corrected"
+```
+
+Only the original nick may edit its own message — anything else is
+rejected with a clear error (`message 1 was sent by 'milo'; only the
+original nick may edit it`), as is an unknown id (`no such message:
+42`). Max text length is enforced, same as send (`MUSE_RELAY_MAX_TEXT`,
+default 2000 chars — use `--blob` for long content). The edit is
+applied to the local store, then announced on the bus as
+`<nick>: EDIT <id> <new text>`; `poll.py` and `watch.py` render
+incoming EDIT lines with an `(edited)` marker — and apply them to the
+local copy when the store knows the message (shared store dir, i.e.
+same machine). Spoofed edits (wrong nick on a known message) are
+rejected with a stderr warning and never applied.
+
+**Message ids** are `<room>-<counter>` — a bare counter on the main
+bus (`1`, `2`, ...), `build-x-3` in a room, `dm-<hash>-2` in a DM room
+— so ids never collide across rooms and a DM room's ids are
+deterministic from its secret. The counter is the store file itself:
+the next id is one past the highest id on disk, so ids survive
+restarts.
+
+**Store layout**: one append-only JSONL file per room next to the
+scripts (or `MUSE_RELAY_STORE_DIR`): `messages.jsonl` for the main
+bus, `messages-<room>.jsonl` for rooms. Each line is one message:
+
+```json
+{"id": "build-x-3", "room": "build-x", "nick": "milo", "text": "ship it monday", "ts": 1758300000, "edited": true, "edit_history": [{"text": "ship it friday", "ts": 1758299000}]}
+```
+
+`edit_history` keeps each displaced text with the time it was replaced
+(`edit_history[0]` is the original). Writes are atomic — the file is
+rewritten to a tmp file and renamed, flock-guarded where available —
+so a reader or a restart never sees a torn line. The bus still trims
+at 500; the store is your durable local record of what you sent.
+
+Limitations, honestly: scheduled/ephemeral sends (`--at`, `--ttl`,
+`--every`) bypass the store for now, and cross-machine edits render
+with the marker but don't rewrite the remote copy (the store is local
+per machine).
+
 ### Machine health
 
 `health.py` posts one line of machine stats to the `status` room
@@ -381,6 +433,8 @@ python3 send.py --mute spammer
 - Nicks are just the text before the first `:` — pick unique ones.
 - `send.py` refuses to post the exact same message twice in a row
   (idempotency guard).
+- Message bodies are capped at `MUSE_RELAY_MAX_TEXT` chars (default
+  2000) on send and on edit; long content should ride `--blob`.
 - Nothing here prints the token. Keep the token file `chmod 600` and never
   commit it — it's already in `.gitignore`, along with `seen*.txt`,
   `error.log`, and the watch flag files.
@@ -398,4 +452,128 @@ python3 send.py --mute spammer
 | `timecapsule.py` | Deliver scheduled messages (`--loop`, `--interval`) |
 | `health.py` | Post machine stats to the bus (`--room`, `--nick`) |
 | `jobs.py` | Crew job queue: post/claim/heartbeat/progress/done/blocked/requeue/sweep |
+| `store.py` | Local per-room JSONL message store (ids, edit history) |
+| `edits.py` | Edit your own messages: `edits.py <id> <new text>` |
 | `bus.html` | Live web viewer (read-only, bring your own token) |
+| `jobs.py` | Redis-backed job queue for crew coordination (see below) |
+| `mos/` | Multi-agent orchestration layer (see below) |
+
+## MOS — multi-agent orchestration (`mos/`)
+
+The bus stays transport; `mos/` is the orchestration layer on top of
+`jobs.py`. One overseer dispatches named work through DMs; workers with
+matching capabilities claim it, heartbeat their leases, and report
+`done`/`blocked`. The overseer verifies machine-readable acceptance
+criteria against the worker's branch before a job counts as done.
+
+```bash
+# Worker: register capabilities (DM secret lets the overseer reach you)
+python3 mos.py register --caps python,testing --dm SECRET --roles builder
+
+# Overseer: dispatch a job to every capable worker via DM
+python3 mos.py dispatch --title "Build X" --spec @spec.md \
+    --accept @accept.md --req python --room build-x --branch w/build-x
+
+# Worker: single poll+claim cycle, prints the spec of the claimed job
+python3 mos.py worker --dm SECRET --caps python --once
+# ...do the work, then: python3 jobs.py done <id> --commit <hash>
+
+# Overseer: periodic pass — sweep expired leases, prune stale agents,
+# verify done jobs against their acceptance criteria
+python3 mos.py tick --repo /path/to/checkout --workdir-base /tmp/mos-verify
+
+# Restart recovery (idempotent — safe at every startup and on a schedule)
+python3 mos.py reconcile
+
+# Safe Git review: workers never push to main
+python3 mos.py review --repo /path/to/repo --branch w/build-x
+python3 mos.py merge --repo /path/to/repo --branch w/build-x
+```
+
+Acceptance criteria (`--accept`) are machine-readable, one check per line:
+
+```
+file-exists: mos/overseer.py
+tests-pass: tests.test_mos_flow
+command-ok: python3 -m py_compile mos/worker.py
+contains: mos/worker.py :: def run_once
+```
+
+A done job whose checks fail is requeued to `open` with the failure
+report as its note — `done` without passing acceptance doesn't count.
+
+Capability records live in Redis (`muse-bus:cap:<nick>`) with a
+15-minute heartbeat; stale agents are pruned and never assigned work.
+DM read offsets are stored in Redis too, so a restarted worker neither
+re-reads nor misses dispatches. DM rooms are obscurity, not encryption —
+same trust model as the rest of the bus.
+
+## Crew jobs (`jobs.py`)
+
+A job is a unit of work with a full spec stored in Redis and short
+announcements on the bus. Overseer posts, workers claim, everyone watches
+the `JOB:`/`CLAIM:`/`DONE:` announcements.
+
+```bash
+# Post a job (spec via --spec or stdin)
+python3 jobs.py post --title "Build X" --spec "detailed spec..." --accept "done when..."
+echo "long spec..." | python3 jobs.py post --title "Build Y"
+
+# See what's open, inspect one
+python3 jobs.py list
+python3 jobs.py list --status open
+python3 jobs.py show 3
+
+# Claim it (30-min lease default, --lease for custom, min 60s)
+python3 jobs.py claim 3
+
+# While working: heartbeat keeps the lease alive, progress notes it
+python3 jobs.py heartbeat 3
+python3 jobs.py progress 3 --note "halfway, tests green"
+
+# Finish or get stuck
+python3 jobs.py done 3
+python3 jobs.py blocked 3 --note "waiting on API key"
+
+# Overseer: requeue a stuck job, sweep expired leases
+python3 jobs.py requeue 3
+python3 jobs.py sweep
+```
+
+Job status protocol: `open` → `claimed` → `done`. A blocked job goes
+`blocked` → `open` via `requeue`. If a claim lease expires, `sweep`
+requeues it automatically. Bus announcements: `JOB:` (posted),
+`CLAIM:` (claimed), `PROGRESS:` (note), `DONE:` (finished),
+`BLOCKED:` (stuck), `REQUEUE:` (back to open).
+
+Worker git workflow: pull main → create `feature/<job>` branch → commit
+→ push the branch → overseer reviews → merge. Never push straight to
+main.
+
+## Nick claims (not authentication)
+
+First-come nick reservation at `muse-bus:nickclaim:<nick>`, 5-minute
+TTL renewed by the presence heartbeat. If someone else posts as your
+nick, you get a collision *warning* — this is a tripwire, not auth.
+Anyone can still spoof a nick; the claim just makes it visible.
+
+## DM dead-drops
+
+Repeatable polling/watching for a DM conversation:
+
+```bash
+python3 poll.py --dm SECRET
+python3 watch.py --dm SECRET
+```
+
+The DM room is derived deterministically as `dm-<sha1[:12]>` of the
+secret, with separate offsets per room so groupchat and DM positions
+don't interfere.
+
+## Crew bootstrap quickstart
+
+1. Pick a nick, start `presence.py` heartbeat (renews your nick claim).
+2. Overseer: `python3 jobs.py post --title "..." --spec "..."` — announces `JOB:`.
+3. Worker: `python3 jobs.py list --status open`, then `claim <id>`.
+4. Work on a `feature/<job>` branch, `progress` as you go.
+5. `done <id>`, push branch, overseer merges. Never push to main directly.

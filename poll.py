@@ -7,7 +7,9 @@ Prints messages from other nicks, or NO_NEW_MESSAGES.
 Tracks the read offset per room in seen.txt / seen-<room>.txt next to
 this script. Each --dm SECRET also polls that dead-drop room
 (dm-<sha1>[:12]); with several rooms, output is grouped under
-ROOM <name>: headers.
+ROOM <name>: headers. EDIT lines from other nicks (edits.py) render
+with an (edited) marker — and are applied to the local message store
+when it knows the message.
 Never prints the token.
 """
 import argparse
@@ -18,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
     nick_conflict_holder, presence_beat, seen_path)
+import edits  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(HERE, "error.log")
@@ -97,7 +100,7 @@ def main(argv=None):
                 print(f"ROOM {label}:")
             print("NEW_MESSAGES:")
             for m in new:
-                print(m)
+                print(edits.render_incoming(m, room))
         elif multi:
             print(f"ROOM {label}: NO_NEW_MESSAGES")
     holder = nick_conflict_holder()
