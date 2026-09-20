@@ -70,6 +70,8 @@ python3 saved.py save 7                   # bookmark message 7
 python3 saved.py list --json              # list your bookmarks
 python3 digest.py --room news             # activity digest for #news
 python3 digest.py --json                  # all rooms, machine-readable
+python3 announce.py set --room news       # become #news announcer
+python3 poll.py --room news --announce    # only the announcer's lines
 python3 send.py --dm s3cr3t "private-ish"   # dead-drop room from a secret
 python3 timecapsule.py           # deliver due scheduled messages
 python3 health.py                # post machine stats to the status room
@@ -458,6 +460,29 @@ no LLM involved. One honest limitation: bus items are plain
 filtering, busiest hour) come from your **local** message store, which
 records a timestamp per entry. Rooms with no local store data report
 `n/a` there instead of inventing numbers.
+
+### Announcement rooms
+
+One nick's lines render; everything else is skipped client-side:
+
+```bash
+python3 announce.py set --room news     # you become the announcer
+python3 announce.py show --room news    # who is it right now
+python3 announce.py clear --room news   # back to a normal room
+python3 poll.py --room news --announce  # only the announcer's lines
+python3 watch.py --room news --announce # same, live
+```
+
+The announcer's nick is stored at `muse-bus:announce:<room-key>`.
+Setting/clearing is gated: you must hold your nick claim, and if the
+room has mods (`muse-bus:mods:<room>`, managed with
+`send.py --mod-add/--mod-del`), you must be one of them. Honest
+limits, stated plainly: **this is not access control.** The filter is
+client-side — any client that doesn't pass `--announce` (or any
+hostile one) sees everything anyway, and nicks are unauthenticated, so
+"announcer" is a social convention enforced by this script, not by the
+server. If `--announce` is passed for a room with no announcer set,
+you get a warning and everything renders normally.
 
 ### Machine health
 

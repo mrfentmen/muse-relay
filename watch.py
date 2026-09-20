@@ -29,6 +29,7 @@ from relay_common import (  # noqa: E402
     nick_conflict_holder, presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
+import announce  # noqa: E402
 
 
 def read_seen(path):
@@ -47,11 +48,13 @@ def write_seen(path, n):
         print(f"WARNING: seen write failed ({e})", file=sys.stderr)
 
 
-def watch_once(targets):
+def watch_once(targets, announce_only=False):
     """One poll iteration over all targets.
 
     targets: list of [label, key, seen_file, seen]. Returns the number
     of new messages from other nicks printed. Updates seen in place.
+    When announce_only is true, per-room announce filtering applies:
+    only the announcer's lines render (see announce.py).
     Raises FileNotFoundError when the token file is missing.
     """
     shown = 0
@@ -67,6 +70,18 @@ def watch_once(targets):
             st = store.open_store(store.room_for_key(key))
         except Exception:
             st = None
+        if announce_only:
+            ann = announce.get_announcer(key)
+            if ann is None:
+                print(f"WARNING: --announce on {label}, but no announcer "
+                      f"is set — rendering everything", file=sys.stderr)
+            else:
+                kept, skipped = announce.announce_filter(key, msgs)
+                if skipped:
+                    print(f"NOTE: skipped {skipped} non-announcer "
+                          f"line(s) in {label} (--announce)",
+                          file=sys.stderr)
+                msgs = kept
         for m in msgs:
             if isinstance(m, str) and not m.startswith(NICK + ":"):
                 print(edits.render_incoming(m, store.room_for_key(key)),
@@ -98,6 +113,9 @@ def main(argv=None):
     ap.add_argument("--dm", default=[], action="append", metavar="SECRET",
                     help="also watch the dead-drop room for SECRET "
                          "(repeatable)")
+    ap.add_argument("--announce", action="store_true",
+                    help="announce-room filter: only the room announcer's "
+                         "lines render (see announce.py)")
     args = ap.parse_args(argv)
     if args.interval <= 0:
         print("interval must be positive", file=sys.stderr)
@@ -119,7 +137,7 @@ def main(argv=None):
     try:
         while True:
             try:
-                watch_once(targets)
+                watch_once(targets, announce_only=args.announce)
             except FileNotFoundError:
                 print("RELAY_ERROR: token file missing: " + TOKEN_FILE,
                       file=sys.stderr)

@@ -24,6 +24,7 @@ from relay_common import (  # noqa: E402
     nick_conflict_holder, presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
+import announce  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ERROR_LOG = os.path.join(HERE, "error.log")
@@ -81,6 +82,9 @@ def main(argv=None):
     ap.add_argument("--dm", default=[], action="append", metavar="SECRET",
                     help="also poll the dead-drop room for SECRET "
                          "(repeatable)")
+    ap.add_argument("--announce", action="store_true",
+                    help="announce-room filter: only the room announcer's "
+                         "lines render (see announce.py)")
     args = ap.parse_args(argv)
     try:
         rooms = [clean_room(args.room)]
@@ -103,6 +107,17 @@ def main(argv=None):
             print(f"RELAY_ERROR: {e}")
             return 2
         label = f"room '{room}'" if room else "main bus"
+        if args.announce:
+            ann = announce.get_announcer(key)
+            if ann is None:
+                print(f"WARNING: --announce on {label}, but no announcer "
+                      f"is set — rendering everything", file=sys.stderr)
+            else:
+                new, skipped = announce.announce_filter(key, new)
+                if skipped:
+                    print(f"NOTE: skipped {skipped} non-announcer "
+                          f"line(s) in {label} (--announce)",
+                          file=sys.stderr)
         if new:
             any_new = True
             if multi:
