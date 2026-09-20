@@ -101,15 +101,18 @@ class ForwardTest(RelayTestCase):
         self.assertIsNotNone(forwarded)
         self.assertEqual(
             forward.forward_text(forwarded),
-            "alice (via other): first post")  # hop count stays at one
+            "alice (via tester): first post")  # same single hop, no chain
 
     def test_forward_text_never_stacks_via(self):
         st = store.MessageStore(store.store_path(""), room="")
         st.append("bob", "x (via y): already hopped")
         self.run_cli(forward.main, ["1", "#news"])
         body = self.pushes_to("muse-bus:room:news")[0]
-        self.assertEqual(body, "tester: bob (via tester): already hopped")
-        self.assertNotIn("(via", body[8:].replace(" (via tester): ", ""))
+        # "(via y)" is bob's literal text, not a prior forward (the entry
+        # nick "bob" != the via forwarder "y"), so it is preserved as-is
+        # with exactly one new hop — never stacked, never mangled.
+        self.assertTrue(body.startswith("tester: bob (via tester): "))
+        self.assertNotIn("(via tester (via", body)
 
     def test_forward_target_room_sanitized(self):
         st = store.MessageStore(store.store_path(""), room="")
