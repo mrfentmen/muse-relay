@@ -213,6 +213,143 @@ class BusRenameWiring(unittest.TestCase):
         self.assertIn("loadNames", self.feat)
         self.assertIn("wireNicks", self.feat)
 
+def _feature_iife():
+    """Extract the tap-to-rename IIFE source from bus.html."""
+    with open(HTML, encoding="utf-8") as f:
+        html = f.read()
+    feat = re.search(r"// ---- FEATURE: tap-to-rename ----(.*?)"
+                     r"// ================== END FEATURES",
+                     html, re.S).group(1)
+    start = feat.index("(function () {")
+    return feat[start:feat.rindex("})();") + len("})();")]
+
+
+# Node driver: stub DOM, load the real IIFE, wrap a stub renderPresence,
+# then assert the online board shows display names and taps open rename.
+# Built with string concatenation to dodge triple-quote escaping issues.
+_PRESENCE_DOM_PARTS = [
+    "var clickHandlers = [];",
+    "var renderCalls = [];",
+    "var els = {};",
+    "function mkEl() {",
+    "  return {",
+    "    _t: '', _v: '', _h: true, _c: '', title: '', style: {},",
+    "    get textContent() { return this._t; },",
+    "    set textContent(v) { this._t = v; },",
+    "    get value() { return this._v; },",
+    "    set value(v) { this._v = v; },",
+    "    get hidden() { return this._h; },",
+    "    set hidden(v) { this._h = v; },",
+    "    set className(v) { this._c = v; },",
+    "    set innerHTML(v) { this._hml = v; },",
+    "    appendChild: function (c) { this._kids = this._kids || []; this._kids.push(c); },",
+    "    addEventListener: function (ev, fn) { this._fn = fn; },",
+    "    focus: function () {},",
+    "    querySelectorAll: function () { return []; }",
+    "  };",
+    "}",
+    "function makeWho(nick) {",
+    "  var w = mkEl();",
+    "  w._nick = nick;",
+    "  w._datanick = null;",
+    "  w.getAttribute = function (k) { return this._datanick; };",
+    "  w.setAttribute = function (k, v) { this._datanick = v; };",
+    "  Object.defineProperty(w, 'textContent',",
+    "    { get: function () { return '\\u25cf' + this._nick; } });",
+    "  w.addEventListener = function (ev, fn) { clickHandlers.push({ nick: this._nick, fn: fn }); };",
+    "  return w;",
+    "}",
+    "var whos = [makeWho('mute'), makeWho('del')];",
+    "var presenceEl = mkEl();",
+    "presenceEl.querySelectorAll = function (sel) { return sel === '.who' ? whos : []; };",
+    "var window = {};",
+    "var document = {",
+    "  getElementById: function (id) {",
+    "    if (id === 'bus-rename-css' || id === 'busRenameModal') return {};",
+    "    if (id === 'presence') return presenceEl;",
+    "    if (!els[id]) els[id] = mkEl();",
+    "    return els[id];",
+    "  },",
+    "  createElement: function () { return mkEl(); },",
+    "  createTextNode: function (tx) { return { _t: tx }; },",
+    "  head: { appendChild: function () {} },",
+    "  body: { appendChild: function () {} }",
+    "};",
+    "window.renderPresence = function (nicks) { renderCalls.push(nicks); };",
+    "window.busUtil = {",
+    "  el: function (id) { return document.getElementById(id); },",
+    "  esc: function (s) { return s; },",
+    "  api: function () { return Promise.resolve({}); },",
+    "  myNick: function () { return 'mrfentmen'; }",
+    "};",
+    "window.busHooks = { message: [], connect: [], poll: [] };",
+    "var crypto = { getRandomValues: function (b) { for (var i = 0; i < b.length; i++) b[i] = i; } };",
+    "var setInterval = function () {};",
+    "__IIFE__",
+    "var out = {};",
+    "out.wrapped = window.renderPresence._rnwrapped === true;",
+    "window.__busTest.busRename._cache({ mute: 'hana', del: 'rowan' });",
+    "window.renderPresence(['mute', 'del']);",
+    "out.renderCalls = renderCalls.length;",
+    "out.label0 = whos[0]._kids[1]._t;",
+    "out.label1 = whos[1]._kids[1]._t;",
+    "out.handlers = clickHandlers.length;",
+    "clickHandlers[0].fn();",
+    "out.openedNick = els['bus-rn-nick']._t;",
+    "out.openedCurrent = els['bus-rn-current']._t;",
+    "console.log(JSON.stringify(out));",
+]
+
+
+def _run_presence_dom():
+    script = "\n".join(_PRESENCE_DOM_PARTS).replace("__IIFE__",
+                                                   _feature_iife())
+    with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                     delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        r = subprocess.run(["node", path], capture_output=True, text=True,
+                           timeout=60)
+    finally:
+        os.unlink(path)
+    assert r.returncode == 0, "node failed: " + r.stderr
+    return json.loads(r.stdout)
+
+
+class BusRenamePresenceDom(unittest.TestCase):
+    """The online board must show display names, and tapping one opens
+    the rename sheet — verified with a stub DOM in Node."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dom = _run_presence_dom()
+
+    def test_render_presence_is_wrapped(self):
+        self.assertTrue(self.dom["wrapped"])
+
+    def test_original_render_still_runs(self):
+        self.assertEqual(self.dom["renderCalls"], 1)
+
+    def test_presence_shows_display_names(self):
+        self.assertEqual(self.dom["label0"], "hana")
+        self.assertEqual(self.dom["label1"], "rowan")
+
+    def test_presence_names_are_tappable(self):
+        self.assertEqual(self.dom["handlers"], 2)
+
+    def test_tapping_presence_name_opens_rename(self):
+        self.assertEqual(self.dom["openedNick"], "mute")
+        self.assertEqual(self.dom["openedCurrent"], "hana")
+
+    def test_presence_wiring_present_in_feature(self):
+        with open(HTML, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn("applyPresenceNames", html)
+        self.assertIn("renderPresence", html)
+
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

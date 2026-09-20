@@ -2696,6 +2696,7 @@ try {
       var r = await U.api("/hgetall/" + ADMIN_PREFIX + ":names");
       nameCache = parseNames(r && r.result);
       applyNames();
+      applyPresenceNames();
     } catch (e) { /* names are best-effort; the log matters more */ }
   }
 
@@ -2821,6 +2822,50 @@ try {
   H.connect.push(function () { loadNames(); wireNicks(); });
   H.poll.push(function () { wireNicks(); });
   setInterval(function () { loadNames(); }, 60000);
+
+  /* ---- presence strip ("online:" board): show display names,
+     tappable to rename. renderPresence rebuilds the strip on every
+     poll, so we wrap it and re-apply after each render. ---- */
+  function applyPresenceNames() {
+    var pel = U.el("presence");
+    if (!pel) return;
+    var whos = pel.querySelectorAll(".who");
+    for (var i = 0; i < whos.length; i++) {
+      var who = whos[i];
+      var nick = who.getAttribute("data-nick");
+      if (!nick) {
+        nick = who.textContent.replace(/^\s*\u25cf\s*/, "");
+        who.setAttribute("data-nick", nick);
+        who.style.cursor = "pointer";
+        (function (elm) {
+          elm.addEventListener("click", function () {
+            openBusRename(elm.getAttribute("data-nick"));
+          });
+        })(who);
+      }
+      who.innerHTML = "";
+      var dot = document.createElement("span");
+      dot.className = "dot";
+      dot.textContent = "\u25cf";
+      who.appendChild(dot);
+      who.appendChild(document.createTextNode(labelFor(nameCache, nick)));
+      who.title = "tap to rename " + nick;
+    }
+  }
+
+  (function wrapPresence() {
+    try {
+      if (typeof window.renderPresence !== "function") return;
+      if (window.renderPresence._rnwrapped) return;
+      var orig = window.renderPresence;
+      var wrapped = function (nicks) {
+        orig(nicks);
+        try { applyPresenceNames(); } catch (e) { /* never break the log */ }
+      };
+      wrapped._rnwrapped = true;
+      window.renderPresence = wrapped;
+    } catch (e) { /* never break the log */ }
+  })();
 
   window.__busTest = window.__busTest || {};
   window.__busTest.busRename = {
