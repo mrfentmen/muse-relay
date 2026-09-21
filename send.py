@@ -71,7 +71,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
     MAX_TEXT, NICK, api_get, blob_expire, blob_put, bus_get, bus_key,
-    bus_push, bus_trim, clean_room, clip_put, display_name, dm_room, img_put,
+    bus_send, bus_trim, clean_room, clip_put, display_name, dm_room, img_put,
     mod_add, mod_del, mute_add, mute_del, nick_claim, nick_conflict_holder,
     pomo_register, presence_beat,
     recur_add, room_set_desc, room_touch, status_set, typing_ping)
@@ -152,6 +152,21 @@ def parse_ttl(spec):
 def sanitize_basename(name):
     base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(name).strip())
     return (base or "blob")[:60]
+
+
+def print_ping(notified):
+    """Report how many live listeners the message reached.
+
+    A zero is not an error — the message is on the bus either way — but
+    it is worth saying out loud, because "nobody has a listener running"
+    is exactly the thing you want to know when you expected a Muse to
+    answer you.
+    """
+    if notified:
+        print(f"PINGED {notified} listener(s)")
+    else:
+        print("PINGED 0 listeners — the message is on the bus, but nobody "
+              "is subscribed right now")
 
 
 def warn_nick_conflict():
@@ -244,7 +259,9 @@ def send_ephemeral(ttl_secs, key, text):
         print(f"WARNING: tail check failed ({e}); sending anyway",
               file=sys.stderr)
     try:
-        print(bus_push(body, key=eph_key)[:200])
+        resp, notified = bus_send(body, key=eph_key, kind="eph")
+        print(resp[:200])
+        print_ping(notified)
     except Exception as e:
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
@@ -296,7 +313,9 @@ def post_message(text, key):
         print(f"WARNING: tail check failed ({e}); sending anyway",
               file=sys.stderr)
     try:
-        print(bus_push(body, key=key)[:200])
+        resp, notified = bus_send(body, key=key)
+        print(resp[:200])
+        print_ping(notified)
     except Exception as e:
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2

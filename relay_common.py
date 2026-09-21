@@ -72,6 +72,68 @@ def _presence_key(nick):
     return "muse-bus:presence:" + urllib.parse.quote(nick, safe="")
 
 
+# --- The doorbell: PUBLISH every message for live listeners -------------#
+# Upstash serves PUBLISH over REST but SUBSCRIBE only over a TCP
+# connection (see the PUBLISH / SUBSCRIBE command docs), so the ring is
+# one cheap REST call and listeners hold a socket (resp.py + listen.py).
+# Pub/sub keeps NO history: this is a wake-up tap, never the record. The
+# list stays the source of truth, and listen.py replays a disconnect gap
+# by reading the list from its cursor. A failed ring is never fatal — a
+# doorbell that cannot ring must not break the send that rang it.
+#
+# MUSE_RELAY_LIVE_CHANNEL overrides the channel name; MUSE_RELAY_NO_PING=1
+# disables ringing entirely (bulk imports, migrations, tests).
+
+def live_channel():
+    """Redis pub/sub channel the live listeners subscribe to."""
+    return os.environ.get("MUSE_RELAY_LIVE_CHANNEL", "muse-bus:live")
+
+
+def pinging_enabled():
+    """False when MUSE_RELAY_NO_PING asks for a silent bus."""
+    return os.environ.get("MUSE_RELAY_NO_PING", "").strip().lower() \
+        not in ("1", "true", "yes", "on")
+
+
+def live_path(room=None):
+    """Read-offset file for a listening reader (listen.py).
+
+    Separate from seen_path: poll.py and watch.py share read offsets, and
+    a listener must not eat the messages a polling agent has not seen
+    yet.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    clean = clean_room(room)
+    name = "live-seen.txt" if not clean else f"live-seen-{clean}.txt"
+    return os.path.join(here, name)
+
+
+def live_envelope(key, body, kind="msg"):
+    """The JSON payload carried on the live channel for one message."""
+    return json.dumps({"room": key, "kind": kind, "body": body,
+                       "ts": int(time.time())}, sort_keys=True)
+
+
+def publish_event(key, body, kind="msg"):
+    """Ring the doorbell: PUBLISH one bus message to the live channel.
+
+    Returns the number of listeners the message reached, or 0 when
+    nobody is subscribed or the publish failed. Best-effort by design;
+    single attempt, no retry loop, because this is latency on the send
+    path and the message is already safely on the list.
+    """
+    if not pinging_enabled():
+        return 0
+    envelope = live_envelope(key, body, kind)
+    try:
+        raw = api_get(
+            f"publish/{live_channel()}/{urllib.parse.quote(envelope, safe='')}",
+            retries=1)
+        return int(json.loads(raw).get("result") or 0)
+    except Exception:
+        return 0
+
+
 # --- Status messages -----------------------------------------------------#
 # A nick can carry a free-text status ("heads down", "in a call") that
 # lives at muse-bus:status:<nick> with the same 120s TTL as presence:
@@ -147,13 +209,27 @@ def presence_beat(roomkey=None):
     that specific room. Also renews this instance's nick claim and the
     nick's status message TTL, if one is set. Best-effort — callers
     should not fail if this does.
+
+    The heartbeat's own writes go out as ONE pipelined request (they are
+    independent, so they need no round trip each); the nick claim and the
+    status refresh keep their read-then-write logic and their own calls.
     """
     q = urllib.parse.quote(NICK, safe="")
-    api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
-    api_get(f"sadd/{NICKS_KEY}/{q}")
+    cmds = [["SETEX", _presence_key(NICK), PRESENCE_TTL, "1"],
+            ["SADD", NICKS_KEY, NICK]]
     if roomkey:
-        api_get(f"setex/muse-bus:presence:room:{roomkey}:{q}/"
-                f"{PRESENCE_TTL}/1")
+        cmds.append(["SETEX", f"muse-bus:presence:room:{roomkey}:{q}",
+                     PRESENCE_TTL, "1"])
+    try:
+        api_pipeline(cmds)
+    except Exception:
+        # Same work, one curl per command, when the pipeline is
+        # unavailable. Raises like it always has if the bus is down.
+        api_get(f"setex/{_presence_key(NICK)}/{PRESENCE_TTL}/1")
+        api_get(f"sadd/{NICKS_KEY}/{q}")
+        if roomkey:
+            api_get(f"setex/muse-bus:presence:room:{roomkey}:{q}/"
+                    f"{PRESENCE_TTL}/1")
     try:
         nick_claim()
     except Exception:
@@ -412,6 +488,22 @@ def bus_total(key=None):
         return None
 
 
+def _llen_and_total(key):
+    """(llen, total) for a bus list, in one request when possible.
+
+    Both numbers are needed before the message range can be computed, and
+    neither depends on the other, so they ride one pipelined request.
+    Falls back to two calls when the pipeline endpoint is unavailable, so
+    a reader is never worse off than one curl per command.
+    """
+    try:
+        res = api_pipeline([["LLEN", key], ["GET", key + ":total"]])
+        raw = res[1]
+        return int(res[0] or 0), (int(raw) if raw is not None else None)
+    except Exception:
+        return bus_llen(key), bus_total(key)
+
+
 def bus_read(consumed, key=None):
     """Read bus messages after an absolute cursor; detect trimmed loss.
 
@@ -432,8 +524,7 @@ def bus_read(consumed, key=None):
     list has no total counter (nothing was ever trimmed from it, or it
     predates the counter).
     """
-    llen = bus_llen(key)
-    total = bus_total(key)
+    llen, total = _llen_and_total(key or BUS)
     if total is None or total < llen:
         msgs = bus_get(consumed, -1, key=key)
         return msgs, consumed + len(msgs), 0
@@ -497,11 +588,55 @@ def _bump_total(key):
         pass
 
 
+def bus_send(body, key=None, kind="msg"):
+    """Push a message and ring the doorbell in ONE request.
+
+    Returns (response_text, notified): the RPUSH reply as JSON text, in
+    the same shape bus_push has always returned, and how many live
+    listeners the doorbell reached (0 when nobody is subscribed or
+    pinging is off). Upstash's /pipeline endpoint takes RPUSH, INCR and
+    PUBLISH in a single request, so the message, its monotonic counter
+    and the ring cost one round trip instead of three.
+
+    Falls back to bus_push (which bumps the counter itself) plus
+    publish_event when the pipeline endpoint is unavailable, so a proxy
+    or an older instance loses speed, never behavior. Raises when the
+    message itself could not be stored.
+    """
+    key = key or BUS
+    if pinging_enabled():
+        try:
+            res = api_pipeline([["RPUSH", key, body],
+                                ["INCR", key + ":total"],
+                                ["PUBLISH", live_channel(),
+                                 live_envelope(key, body, kind)]])
+        except Exception:
+            res = None
+        if res is not None:
+            if isinstance(res[0], PipelineError):
+                raise RuntimeError(f"rpush failed: {res[0]}")
+            notified = res[2] if isinstance(res[2], int) else 0
+            return (json.dumps({"result": res[0]},
+                               separators=(",", ":")), notified)
+    resp = bus_push(body, key=key)
+    return resp, publish_event(key, body, kind)
+
+
 def api_post(path, body):
     """POST a raw body to <RELAY_URL>/<path>; returns the raw response.
 
     Same curl transport as bus_push. Used for values too big or awkward
     for a URL path segment (job specs, long text).
+    """
+    return _post_raw(path, body)
+
+
+def _post_raw(path, data, retries=4):
+    """POST a raw body to <RELAY_URL>/<path>; returns the response text.
+
+    Shared by api_post and api_pipeline. curl rather than urllib for the
+    same reason api_get uses it: urllib intermittently drops connections
+    to Upstash in some environments while curl stays reliable.
     """
     _check_config()
     token = _token()
@@ -511,9 +646,10 @@ def api_post(path, body):
            "-H", "Connection: close",
            "--data-binary", "@-",
            f"{RELAY_URL}/{path}"]
-    data = body.encode("utf-8") if isinstance(body, str) else body
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     last_err = "no attempts"
-    for _ in range(4):
+    for _ in range(retries):
         try:
             p = subprocess.run(cmd, input=data, capture_output=True,
                                timeout=30)
@@ -526,7 +662,55 @@ def api_post(path, body):
         last_err = (p.stderr.decode("utf-8", "replace").strip()
                     or f"curl rc={p.returncode}")[:160]
         time.sleep(2)
-    raise RuntimeError(f"post failed after 4 attempts: {last_err}")
+    raise RuntimeError(f"post failed after {retries} attempts: {last_err}")
+
+
+class PipelineError(str):
+    """One command's failure inside a pipeline.
+
+    A str subclass: a caller that ignores the distinction still prints
+    the server's complaint instead of an empty value.
+    """
+
+
+def api_pipeline(commands, retries=4):
+    """Run several commands in ONE HTTP request; returns their results.
+
+    `commands` is a list of argument lists, e.g.
+    [["SETEX", key, 120, "1"], ["SADD", "muse-bus:nicks", "milo"]].
+    The reply is a list of the same length and order: each entry is that
+    command's value, or a PipelineError when only that command failed.
+
+    This is a LATENCY win, not a quota one. Upstash bills every command
+    inside a pipeline individually (see the billing docs), so what
+    collapses is the number of round trips — six curls at ~50ms each
+    become one request of the same six commands.
+
+    Raises RuntimeError when the request itself failed or the reply was
+    not the expected one-object-per-command array, which is the signal
+    for callers to fall back to api_get per command.
+    """
+    if not commands:
+        return []
+    payload = json.dumps([[str(a) for a in cmd] for cmd in commands])
+    raw = _post_raw("pipeline", payload, retries=retries)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"pipeline reply was not JSON: {raw[:120]!r}")
+    if not isinstance(data, list) or len(data) != len(commands):
+        raise RuntimeError(
+            f"pipeline reply was not a {len(commands)}-item array: "
+            f"{raw[:120]!r}")
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            out.append(PipelineError(f"malformed reply entry: {item!r}"))
+        elif "result" in item:
+            out.append(item["result"])
+        else:
+            out.append(PipelineError(str(item.get("error", "no result"))))
+    return out
 
 
 def mark_seen(key, nick, offset):

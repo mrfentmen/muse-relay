@@ -41,10 +41,14 @@ STUCK_ALERT_EVERY = int(
 
 
 def _say(room, text):
-    """Best-effort announcement; never fails the state change."""
+    """Best-effort announcement; never fails the state change.
+
+    bus_send so job invites and state changes ring the live doorbell —
+    a crewed worker with listen.py hears a dispatch instantly.
+    """
     try:
         key = rc.bus_key(room)
-        rc.bus_push(f"{rc.NICK}: {text}", key=key)
+        rc.bus_send(f"{rc.NICK}: {text}", key=key)
         rc.bus_trim(key=key)
         rc.presence_beat(key)
     except Exception as e:

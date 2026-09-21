@@ -21,7 +21,9 @@ import urllib.parse
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 import dynamic_credentials as dc  # noqa: E402
 
-ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+ENDPOINT = os.environ.get(
+    "MUSE_RELAY_URL",
+    "https://upright-mosquito-285786.upstash.io").rstrip("/")
 HOST = "upright-mosquito-285786.upstash.io"
 CRED = "custom.upstash-muse-bus"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,9 +58,43 @@ def api_get(path, surrogate):
     raise RuntimeError(f"request failed after 4 attempts: {last_err}")
 
 
+def read_new(key, seen, surrogate):
+    """Read messages after an absolute cursor; detect trimmed loss.
+
+    Port of relay_common.bus_read, for the same reason it exists there:
+    the list is capped by LTRIM, which shifts every index down, so a
+    cursor stored as a raw list index silently skips everything trimmed
+    out from under it — and any gap bigger than the cap is total loss
+    with no error. `seen` is an absolute count of messages this reader
+    has taken, which is what the seen file has always held.
+
+    Returns (messages, next_cursor, lost). Falls back to plain index
+    semantics — no loss detection — when the list has no total counter.
+    """
+    import json
+    llen = int(json.loads(api_get(f"llen/{key}", surrogate)).get("result")
+               or 0)
+    raw_total = json.loads(api_get(f"get/{key}:total", surrogate)).get(
+        "result")
+    total = int(raw_total) if raw_total is not None else None
+    if total is None or total < llen:
+        msgs = json.loads(
+            api_get(f"lrange/{key}/{seen}/-1", surrogate)).get("result") or []
+        return [m for m in msgs if isinstance(m, str)], seen + len(msgs), 0
+    if total < seen:          # counter reset; never move the cursor back
+        total = seen
+    first = total - llen       # absolute index of the oldest kept message
+    lost = max(0, first - seen)
+    start = max(0, seen - first)
+    if start >= llen:
+        return [], total, lost
+    msgs = json.loads(
+        api_get(f"lrange/{key}/{start}/-1", surrogate)).get("result") or []
+    return [m for m in msgs if isinstance(m, str)], total, lost
+
+
 def main(argv):
     import argparse
-    import json
     ap = argparse.ArgumentParser()
     ap.add_argument("--room", default=None,
                     help="room to poll (default: main bus)")
@@ -76,8 +112,7 @@ def main(argv):
         seen = 0
 
     surrogate = _surrogate()
-    data = json.loads(api_get(f"lrange/{key}/{seen}/-1", surrogate))
-    msgs = data.get("result") or []
+    msgs, seen, lost = read_new(key, seen, surrogate)
 
     # Presence heartbeat: mark this nick online for 120s. Best-effort.
     try:
@@ -87,15 +122,20 @@ def main(argv):
     except Exception:
         pass
 
-    new = [m for m in msgs
-           if isinstance(m, str) and not m.startswith(NICK + ":")]
-    seen += len(msgs)
+    new = [m for m in msgs if not m.startswith(NICK + ":")]
     try:
         with open(seen_file, "w") as f:
             f.write(str(seen))
     except OSError:
         pass
 
+    if lost:
+        # Loud on purpose: a gap this size means messages were dropped
+        # before this reader reached them. Staying silent here is the
+        # failure this counter exists to prevent.
+        print(f"WARNING: {lost} message(s) in {key} were trimmed off the "
+              f"bus before this poll read them (raise MUSE_RELAY_KEEP or "
+              f"poll more often)", file=sys.stderr)
     if new:
         print("NEW_MESSAGES:")
         for m in new:

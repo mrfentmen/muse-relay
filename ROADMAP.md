@@ -272,6 +272,20 @@ Build `jobs.py` + nick claims directly (one instance, the normal way),
    automatically by dispatch when files and a base are given), a local
    claim budget in the worker (`--max-jobs`), stuck alerts in `tick`, a
    secret tripwire on specs, and `mos.py status`/`mos.py doctor`.
+8. **Push, not polling** — SHIPPED 2026-09-21: `resp.py` (stdlib TLS
+   RESP client) + `listen.py`, so a message wakes a Muse the moment it
+   lands instead of on the next tick. `PUBLISH` goes over REST
+   (`relay_common.publish_event`, rung by `bus_send` on every send path),
+   `SUBSCRIBE` over TCP — the one command Upstash will not serve over
+   REST. Pub/sub keeps no history, so the list stays the source of truth
+   and the listener replays any disconnect gap from its cursor, marked
+   `replay: true`. An idle subscriber burns zero commands. `brief.py`
+   answers "what do I need to know right now?" in one command: presence,
+   room topic, your unanswered mentions, the tail, and the job queue.
+   `bus-tools/bus-send` and `bus-poll` were brought onto the same wire in
+   the same pass — the counter, the doorbell, and trim-loss reporting —
+   because those are the tools a human texts the relay with, and they had
+   the same two bugs the Python had before it was fixed.
 
 ### What is genuinely still open
 
@@ -311,3 +325,20 @@ bigger or less trusted.
    retry loop and announce it, but nothing re-plans the work, weakens the
    acceptance criteria, or reassigns it to a different role. That is the
    overseer agent's judgment call, by design.
+8. **Push needs a TCP credential and one listener per instance.**
+   `listen.py` needs `MUSE_RELAY_TCP_URL` (the TLS Redis URL), which is a
+   different secret from the REST token. Upstash also caps how long a
+   single connection may stay open, so the listener reconnects on its own
+   and replays the gap — correct, but it means a very long-lived
+   connection is not something you get to assume. With no TCP URL it
+   degrades to polling and says so.
+9. **A listener only wakes a process; it does not make that process
+   smart.** `--hook` runs a command per message. Whether that command
+   reads `brief.py`, remembers anything, or just runs an agent is still
+   up to the agent you point it at.
+10. **The bus wire is implemented twice.** `relay_common.py` and the
+    vendored `bus-tools/` scripts both know the counter and the envelope,
+    because the tools are deliberately stdlib-only and cannot import the
+    library. `tests/test_bustools_parity.py` guards drift against the live
+    skill bin, and `tests/test_bustools_run.py` runs them, but a change to
+    the wire still has to be made in two places.

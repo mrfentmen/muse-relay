@@ -30,7 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    MAX_TEXT, NICK, bus_key, bus_push, bus_trim, clean_room, dm_room,
+    MAX_TEXT, NICK, bus_key, bus_send, bus_trim, clean_room, dm_room,
     nick_conflict_holder, presence_beat, room_touch)
 import store  # noqa: E402
 from store import EditError  # noqa: E402,F401  (re-exported for callers)
@@ -159,7 +159,7 @@ def main(argv=None):
         print(f"RELAY_ERROR: {e}", file=sys.stderr)
         return 2
     try:
-        print(bus_push(f"{NICK}: EDIT {args.msg_id} {text}", key=key)[:200])
+        print(bus_send(f"{NICK}: EDIT {args.msg_id} {text}", key=key)[0][:200])
     except Exception as e:
         print(f"RELAY_ERROR: announcement failed ({e}); the edit is "
               f"applied locally but others won't see it", file=sys.stderr)

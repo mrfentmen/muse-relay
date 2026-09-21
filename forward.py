@@ -32,7 +32,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, bus_key, bus_push, bus_trim, clean_room, dm_room,
+    NICK, bus_key, bus_send, bus_trim, clean_room, dm_room,
     nick_conflict_holder, presence_beat, room_touch)
 import store  # noqa: E402
 from store import EditError  # noqa: E402,F401  (consistent error shape)
@@ -99,7 +99,7 @@ def do_forward(room, msg_id, target_room, st=None):
     text = forward_text(entry)
     try:
         tkey = bus_key(target_room)
-        bus_push(f"{NICK}: {text}", key=tkey)
+        bus_send(f"{NICK}: {text}", key=tkey)
         bus_trim(key=tkey)
         presence_beat(tkey)
         room_touch(tkey)

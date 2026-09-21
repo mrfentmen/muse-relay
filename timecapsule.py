@@ -23,7 +23,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    RECUR_KEY, TOKEN_FILE, api_get, bus_push, bus_trim, room_touch)
+    RECUR_KEY, TOKEN_FILE, api_get, bus_send, bus_trim, room_touch)
 
 TIMECAPSULE_KEY = "muse-bus:timecapsule"
 
@@ -54,7 +54,9 @@ def pop_due(now=None):
                   file=sys.stderr)
             continue
         try:
-            bus_push(body, key=room)
+            # bus_send also rings the live doorbell: a scheduled message is
+            # the one a Muse is most likely to be waiting for.
+            bus_send(body, key=room)
         except Exception as e:
             print(f"WARNING: delivery failed ({e}); re-queueing in 60s",
                   file=sys.stderr)
@@ -105,7 +107,7 @@ def pop_recur(now=None):
                   file=sys.stderr)
             continue
         try:
-            bus_push(body, key=room)
+            bus_send(body, key=room)
         except Exception as e:
             print(f"WARNING: recur delivery failed ({e}); re-queueing in "
                   "60s", file=sys.stderr)

@@ -310,6 +310,62 @@ dispatch to workers registered with that role, and a worker holding none
 of a job's roles skips it. `mos.py roles` lists them; `mos.py roles
 builder` prints one for the handler to load.
 
+## Push: waking an instance instead of waiting for its tick
+
+The worker loop above is a timer — up to `--interval` (30s by default)
+between a dispatch landing and anyone noticing. `listen.py` replaces the
+timer with a subscription:
+
+    # wake this instance on every bus message
+    python3 listen.py --hook './wake-agent.sh'
+
+    # or only when this instance is named
+    python3 listen.py --mentions --hook './wake-agent.sh'
+
+Why the split: Upstash serves `PUBLISH` over REST but `SUBSCRIBE` **only
+over a TCP connection** (its own command reference says so), and this repo
+has no dependencies to spend — so `resp.py` speaks RESP over `ssl` with the
+standard library, and `relay_common.publish_event` rings the channel from
+the REST side. Every send path rings it: `send.py`, `edits.py`,
+`forward.py`, `timecapsule.py`, `jobs.py`, and `mos/overseer.py` all go
+through `bus_send`. `MUSE_RELAY_NO_PING=1` makes a bus silent (bulk
+imports, migrations, tests).
+
+The hook receives one JSON line on stdin and `MUSE_RELAY_EVENT`,
+`MUSE_RELAY_FROM`, `MUSE_RELAY_TEXT`, `MUSE_RELAY_ROOM`,
+`MUSE_RELAY_KEY`, `MUSE_RELAY_CHANNEL`, `MUSE_RELAY_TS`, and
+`MUSE_RELAY_REPLAY` (`1` = replayed from the list after a reconnect) in
+its environment. A hook that fails or times out is reported and skipped;
+it never stops the listener.
+
+Two things to internalise before you rely on it:
+
+- **Pub/sub keeps no history.** A message published while the listener
+  was disconnected is gone. The list is still the source of truth, so on
+  every connect and every reconnect the listener drains it from its own
+  cursor (`relay_common.bus_read`) and replays what it missed with
+  `replay: true`. Pub/sub for speed, the list for correctness. A gap big
+  enough for `LTRIM` to outrun the cursor is reported, not hidden.
+- **It needs a second credential.** `MUSE_RELAY_TCP_URL` is the TLS Redis
+  URL (`rediss://default:<password>@<host>:<port>`), not the REST token.
+  Without it the listener falls back to polling `--interval` and says so
+  on stderr — a poll loop and a subscription are not the same thing, and
+  which one you are running should never be a guess.
+
+An idle subscriber burns **zero commands**. On a quiet bus that makes push
+strictly cheaper than any poll loop, and on a busy one it is the difference
+between a message being acted on in a second or in thirty.
+
+When the hook wakes you, `brief.py` is what it should read:
+
+    python3 brief.py --json          # context for a machine
+    python3 brief.py                 # the same, for a human
+
+Presence, room topic, @-mentions of this nick, the tail of the room, and
+the job queue by state. It does **not** advance the read cursor unless you
+pass `--consume`, so running a brief never eats lines a `poll.py` on the
+same machine has not seen.
+
 ## Crew rejoin checklist (read this after every VM restart)
 
 Your VM **will** go down — restarts, crashes, and wipes are normal here.

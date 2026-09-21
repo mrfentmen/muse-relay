@@ -102,8 +102,8 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    INSTANCE_ID, NICK, api_get, api_post, bus_key, bus_push, bus_trim,
-    clean_room, nick_holder, presence_beat)
+    INSTANCE_ID, NICK, api_get, api_post, api_pipeline, bus_key, bus_send,
+    bus_trim, clean_room, nick_holder, presence_beat)
 
 NS = os.environ.get("MUSE_RELAY_JOBNS", "muse-bus:job")
 LEASE_DEFAULT = 1800  # 30 minutes
@@ -169,6 +169,48 @@ def _all_ids():
     """Every job id, oldest first. Raises on transport failure."""
     return json.loads(
         api_get(f"zrange/{_index_key()}/0/-1"))["result"] or []
+
+
+def job_rows(jids=None, limit=None):
+    """Header fields for the known jobs, oldest first, as dicts.
+
+    One pipelined request for every job instead of a HGETALL per job —
+    the whole point of reading the queue is to see all of it at once, and
+    N round trips for that is N times the latency for no benefit. Falls
+    back to per-job reads when the pipeline is unavailable, and skips ids
+    with no header (a job deleted under us).
+
+    Each row is the job's stored fields plus "id". Returns at most
+    `limit` rows (newest last) when given. Raises on transport failure.
+    """
+    ids = _all_ids() if jids is None else list(jids)
+    if limit is not None and len(ids) > limit:
+        ids = ids[-limit:]
+    if not ids:
+        return []
+    try:
+        res = api_pipeline([["HGETALL", _job_key(j)] for j in ids])
+    except Exception:
+        res = None
+    rows = []
+    for i, jid in enumerate(ids):
+        # A successful HGETALL came back as a list of field/value pairs;
+        # anything else (pipeline unavailable, or that one command's
+        # error) is read on its own so one bad key cannot blank the list.
+        item = res[i] if res is not None and i < len(res) else None
+        h = (_pairs_to_dict(item) if isinstance(item, list)
+             else _hgetall(_job_key(jid)))
+        if h:
+            rows.append(dict(h, id=jid))
+    return rows
+
+
+def _pairs_to_dict(flat):
+    """{'k':'v',...} from a HGETALL reply ([k, v, k, v, ...])."""
+    if not isinstance(flat, list):
+        return {}
+    it = iter(flat)
+    return dict(zip(it, it))
 
 
 def reqs_of(h):
@@ -546,10 +588,15 @@ def _creator_warning(h):
 
 
 def _announce(room, text):
-    """Best-effort wire message; never fails the state change."""
+    """Best-effort wire message; never fails the state change.
+
+    Goes through bus_send so a claim or a settle also rings the live
+    doorbell: a worker with listen.py running hears "job 7 is blocked"
+    the moment it happens instead of at its next poll.
+    """
     try:
         key = bus_key(room)
-        bus_push(f"{NICK}: {text}", key=key)
+        bus_send(f"{NICK}: {text}", key=key)
         bus_trim(key=key)
         presence_beat(key)
     except Exception as e:

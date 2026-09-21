@@ -6,6 +6,15 @@ Usage: bus-send "message text" [--room NAME]
 Prefixes the message with "<nick>: " (the sender's display name when the
 admin set one, otherwise the nick; unless already prefixed) and
 appends it to the bus, then trims the list to the newest 500 messages.
+
+Also does the two housekeeping writes the rest of the relay does on every
+push, both best-effort:
+
+  * bumps <key>:total, the counter that makes trimmed-off messages
+    detectable instead of silently skipped (relay_common.bus_read)
+  * PUBLISHes the message to the live channel, so a listener running
+    `listen.py` hears it now instead of at its next reconnect
+
 Never prints the token.
 """
 import os
@@ -18,7 +27,9 @@ import urllib.parse as _uparse
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
 import dynamic_credentials as dc  # noqa: E402
 
-ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+ENDPOINT = os.environ.get(
+    "MUSE_RELAY_URL",
+    "https://upright-mosquito-285786.upstash.io").rstrip("/")
 HOST = "upright-mosquito-285786.upstash.io"
 CRED = "custom.upstash-muse-bus"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +37,9 @@ BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
 KEY_PREFIX = os.environ.get("MUSE_RELAY_KEY_PREFIX", "muse-bus")
 NICK = os.environ.get("MUSE_RELAY_NICK", "mute")
 KEEP = int(os.environ.get("MUSE_RELAY_KEEP", "500"))
+LIVE_CHANNEL = os.environ.get("MUSE_RELAY_LIVE_CHANNEL", "muse-bus:live")
+NO_PING = os.environ.get("MUSE_RELAY_NO_PING", "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 def _surrogate():
@@ -49,6 +63,35 @@ def _curl(args, data=None, surrogate=None):
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
         time.sleep(2)
     raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def ring_the_doorbell(auth, key, body, surrogate):
+    """Best-effort: keep <key>:total in step, then wake live listeners.
+
+    The list is the only source of truth, so neither of these may fail
+    the send — the message is stored by the time this runs. The counter
+    is what makes trim loss detectable (relay_common.bus_read), and the
+    publish is what turns "a listener will notice on its next reconnect"
+    into "a listener hears it now".
+
+    Returns the number of live listeners reached (0 when nobody is
+    subscribed, pinging is off, or the publish failed).
+    """
+    try:
+        _curl(auth + [f"{ENDPOINT}/incr/{key}:total"], surrogate=surrogate)
+    except Exception:
+        pass
+    if NO_PING:
+        return 0
+    envelope = _json.dumps({"room": key, "kind": "msg", "body": body,
+                            "ts": int(time.time())}, sort_keys=True)
+    quoted = _uparse.quote(envelope, safe="")
+    try:
+        raw = _curl(auth + [f"{ENDPOINT}/publish/{LIVE_CHANNEL}/{quoted}"],
+                    surrogate=surrogate)
+        return int(_json.loads(raw).get("result") or 0)
+    except Exception:
+        return 0
 
 
 def main(argv):
@@ -89,7 +132,15 @@ def main(argv):
               surrogate=surrogate)
     except Exception:
         pass
+    notified = ring_the_doorbell(auth, key, text, surrogate)
     print("SENT")
+    # Said out loud on purpose: "nobody has a listener running" is exactly
+    # what you want to know when you expected a Muse to answer you.
+    if notified:
+        print(f"PINGED {notified} listener(s)")
+    elif not NO_PING:
+        print("PINGED 0 listeners — the message is on the bus, but nobody "
+              "is subscribed right now")
     return 0
 
 

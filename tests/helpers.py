@@ -24,8 +24,9 @@ import saved  # noqa: E402
 import digest  # noqa: E402
 import announce  # noqa: E402
 import timecapsule  # noqa: E402
-import export  # noqa: E402
 import webhook  # noqa: E402
+import brief  # noqa: E402
+import listen  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
 
 
@@ -64,6 +65,7 @@ class RelayTestCase(unittest.TestCase):
         self._patches = [
             mock.patch.object(rc, "api_get", self.fake.api_get),
             mock.patch.object(rc, "api_post", self.fake.api_post),
+            mock.patch.object(rc, "api_pipeline", self.fake.api_pipeline),
             mock.patch.object(rc, "bus_push", self.fake.bus_push),
             mock.patch("time.time", self.fake.now),
         ]
@@ -73,8 +75,9 @@ class RelayTestCase(unittest.TestCase):
         # consumers did `from relay_common import api_get/...`: patch the
         # names in their namespaces too, not just relay_common's.
         for mod in (jobs, send, poll, watch, edits, paste, forward,
-                saved, digest, announce, timecapsule, webhook):
-            for name in ("api_get", "api_post", "bus_push"):
+                saved, digest, announce, timecapsule, webhook, brief,
+                listen):
+            for name in ("api_get", "api_post", "api_pipeline", "bus_push"):
                 if hasattr(mod, name):
                     p = mock.patch.object(mod, name,
                                           getattr(self.fake, name))
@@ -93,6 +96,15 @@ class RelayTestCase(unittest.TestCase):
             mock.patch.object(webhook, "seen_path",
                               lambda room: os.path.join(
                                   self.tmp, "hkseen-" + (room or "main"))),
+            mock.patch.object(listen, "live_path",
+                              lambda room: os.path.join(
+                                  self.tmp, "live-" + (room or "main"))),
+            # brief.py --consume writes the same cursor poll.py reads, so
+            # the two share one path here too — that agreement is the
+            # point of the flag.
+            mock.patch.object(brief, "seen_path",
+                              lambda room: os.path.join(
+                                  self.tmp, "seen-" + (room or "main"))),
             mock.patch.object(
                 store, "store_path",
                 lambda room: os.path.join(
@@ -122,6 +134,8 @@ class RelayTestCase(unittest.TestCase):
         forward.NICK = nick
         saved.NICK = nick
         announce.NICK = nick
+        brief.NICK = nick
+        listen.NICK = nick
         rc._claim_state.update(checked=0.0, ok=None, holder=None)
 
     def run_cli(self, mod_main, argv, stdin=None):
@@ -132,6 +146,14 @@ class RelayTestCase(unittest.TestCase):
                 mock.patch("sys.stdin", io.StringIO(stdin or "")):
             rc_code = mod_main(argv)
         return rc_code, out.getvalue(), err.getvalue()
+
+    def hook_script(self, body):
+        """Write an executable shell script in the test's tmp dir."""
+        path = os.path.join(self.tmp, "hook.sh")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
 
     def pushes_to(self, key):
         return [b for k, b in self.fake.pushes if k == key]

@@ -16,59 +16,13 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fake_redis import FakeUpstash  # noqa: E402
+from fake_http import FakeUpstashHTTP  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOKEN = "e2e-super-secret-rest-token"
-
-
-class _Handler(BaseHTTPRequestHandler):
-    """Upstash-shaped REST surface over FakeUpstash."""
-
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):
-        pass  # keep the test output clean
-
-    def _send(self, body):
-        raw = body.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self):
-        self.server.bearer.append(self.headers.get("Authorization", ""))
-        path = self.path.lstrip("/")
-        try:
-            self._send(self.server.backend.api_get(path))
-        except Exception as e:  # surface it the way the real API would
-            self._send(json.dumps({"error": str(e)}))
-
-    def do_POST(self):
-        self.server.bearer.append(self.headers.get("Authorization", ""))
-        n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n)
-        try:
-            self._send(self.server.backend.api_post(self.path.lstrip("/"),
-                                                    body))
-        except Exception as e:
-            self._send(json.dumps({"error": str(e)}))
-
-
-class _Server(ThreadingHTTPServer):
-    allow_reuse_address = True
-
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), _Handler)
-        self.backend = FakeUpstash()
-        self.bearer = []
 
 
 class CliE2ETest(unittest.TestCase):
@@ -77,21 +31,16 @@ class CliE2ETest(unittest.TestCase):
         token_file = os.path.join(self.tmp, "token")
         with open(token_file, "w") as f:
             f.write(TOKEN + "\n")
-        self.server = _Server()
-        self.thread = threading.Thread(target=self.server.serve_forever,
-                                       daemon=True)
-        self.thread.start()
-        self.addCleanup(self.thread.join, 5)
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
+        self.http = FakeUpstashHTTP()
+        self.addCleanup(self.http.close)
+        self.server = self.http.server
         self.handler = os.path.join(self.tmp, "handler.sh")
         with open(self.handler, "w") as f:
             f.write("#!/bin/sh\necho COMMIT deadbee\n")
         self.base_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": self.tmp,
-            "MUSE_RELAY_URL":
-                f"http://127.0.0.1:{self.server.server_port}",
+            "MUSE_RELAY_URL": self.http.url,
             "MUSE_RELAY_TOKEN_FILE": token_file,
             "MUSE_RELAY_BUS": "muse-bus",
             "MUSE_RELAY_JOBNS": "muse-bus:job",

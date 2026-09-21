@@ -8,8 +8,13 @@ api_get returns JSON bodies shaped like the real REST API:
 {"result": <value>}.
 """
 import json
+import os
+import sys
 import time
 import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from relay_common import PipelineError  # noqa: E402
 
 
 class FakeUpstash:
@@ -20,7 +25,11 @@ class FakeUpstash:
         self.lists = {}     # key -> [values]
         self.zsets = {}     # key -> {member: score}
         self.t = time.time()
-        self.pushes = []    # (key, body) recorded from bus_push
+        self.pushes = []    # (key, body) recorded from bus_push/bus_send
+        self.published = []    # (channel, message) from PUBLISH
+        self.subscribers = 0   # the count PUBLISH reports back
+        self.publish_hooks = []  # callables(channel, message), for bridges
+        self.pipeline_calls = []  # command lists, for round-trip assertions
 
     # -- clock ---------------------------------------------------------
     def now(self):
@@ -102,6 +111,8 @@ class FakeUpstash:
                     new += 1
                 h[a[i]] = a[i + 1]
             return new
+        if cmd == "hget":
+            return self.hashes.get(a[0], {}).get(a[1])
         if cmd == "hgetall":
             h = self.hashes.get(a[0], {})
             out = []
@@ -201,24 +212,94 @@ class FakeUpstash:
             for m in doomed:
                 del z[m]
             return len(doomed)
+        if cmd == "rpush":
+            return self._rpush(a[0], a[1])
+        if cmd == "publish":
+            return self._publish(a[0], a[1])
         if cmd == "ping":
             return "PONG"
         raise ValueError(f"fake: unknown command {cmd}")
 
-    # -- api_post / bus_push -------------------------------------------
+    def _rpush(self, key, body):
+        """RPUSH: append and record the push. NOT the counter.
+
+        A bare RPUSH does not touch <key>:total — in the real client the
+        bump is a separate INCR (`relay_common._bump_total` on the
+        bus_push path, an explicit INCR inside the bus_send pipeline).
+        Bumping here too would double-count every message that travels
+        the HTTP path, and bus_read's trim-loss detection reads that
+        counter directly. `bus_push` below is the whole-function stand-in
+        and does its own bump.
+        """
+        self.lists.setdefault(key, []).append(body)
+        self.pushes.append((key, body))
+        return len(self.lists[key])
+
+    def _publish(self, channel, message):
+        """PUBLISH: record it, tell the bridges, report the count."""
+        self.published.append((channel, message))
+        for cb in list(self.publish_hooks):
+            cb(channel, message)
+        return self.subscribers
+
+    # -- api_post / api_pipeline / bus_push ----------------------------
     def api_post(self, path, body):
         segs = path.split("/")
-        assert segs[0] == "set", f"fake api_post only supports set, got {path}"
-        key = urllib.parse.unquote(segs[1])
+        assert segs[0] in ("set", "publish", "rpush"), \
+            f"fake api_post only supports set/publish/rpush, got {path}"
         text = body.decode("utf-8") if isinstance(body, bytes) else body
+        if segs[0] == "rpush":
+            # Upstash takes a raw body on any command path; bus-tools/bus-send
+            # posts message text this way to stay clear of URL length limits.
+            key = urllib.parse.unquote(segs[1])
+            return json.dumps({"result": self._rpush(key, text)})
+        if segs[0] == "publish":
+            channel = urllib.parse.unquote(segs[1])
+            return json.dumps({"result": self._publish(channel, text)})
+        key = urllib.parse.unquote(segs[1])
         self.strings[key] = (text, None)
         return json.dumps({"result": "OK"})
 
+    def api_pipeline(self, commands, retries=4):
+        """Stand-in for relay_common.api_pipeline (the parsed function).
+
+        Returns a list with one entry per command — that command's value,
+        or a PipelineError when only it failed — which is what the real
+        function returns. Callers patch the function, not the transport,
+        so returning the raw response text here would feed them a string
+        where they expect a list (`res[0]` becoming `"["`). Use
+        `pipeline_raw` to exercise the parsing itself.
+        """
+        out = []
+        for item in self._pipeline_items(commands):
+            if "result" in item:
+                out.append(item["result"])
+            else:
+                out.append(PipelineError(str(item.get("error", "no result"))))
+        return out
+
+    def pipeline_raw(self, path, data, retries=4):
+        """The pipeline HTTP reply as text, for testing the parser.
+
+        Signature mirrors relay_common._post_raw so it can be patched in
+        as the transport.
+        """
+        return json.dumps(self._pipeline_items(json.loads(data)))
+
+    def _pipeline_items(self, commands):
+        self.pipeline_calls.append([list(c) for c in commands])
+        items = []
+        for cmd in commands:
+            cmd = [str(a) for a in cmd]
+            try:
+                items.append({"result": self._run(cmd[0].lower(), cmd[1:])})
+            except Exception as e:  # one command's error, not the batch's
+                items.append({"error": str(e)})
+        return items
+
     def bus_push(self, body, key=None):
+        """Stand-in for relay_common.bus_push: RPUSH then the total bump."""
         key = key or "muse-bus"
-        self.lists.setdefault(key, []).append(body)
-        self.pushes.append((key, body))
-        # Mirrors relay_common.bus_push: every RPUSH bumps a monotonic
-        # counter that LTRIM never touches (see relay_common.bus_read).
+        pushed = self._rpush(key, body)
         self._run("incr", [key + ":total"])
-        return json.dumps({"result": len(self.lists[key])})
+        return json.dumps({"result": pushed})
