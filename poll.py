@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room,
+    NICK, TOKEN_FILE, bus_key, bus_read, clean_room, dm_room,
     fmt_remaining, mark_seen, nick_conflict_holder, own_prefixes, pomo_active,
     presence_beat, seen_path)
 import edits  # noqa: E402
@@ -40,8 +40,10 @@ def log_error(msg):
 
 
 def poll_one(key, seen_file):
-    """Poll one room key. Returns (messages, new_from_others).
+    """Poll one room key. Returns (messages, new_from_others, lost).
 
+    `lost` is the number of messages trimmed off the bus before this
+    poll could read them (see relay_common.bus_read) — 0 normally.
     Raises FileNotFoundError when the token file is missing,
     RuntimeError on transport failure.
     """
@@ -50,7 +52,7 @@ def poll_one(key, seen_file):
             seen = int(f.read().strip() or 0)
     except (FileNotFoundError, ValueError):
         seen = 0
-    msgs = bus_get(seen, -1, key=key)
+    msgs, seen, lost = bus_read(seen, key=key)
     try:
         presence_beat(key)
     except Exception as e:
@@ -65,7 +67,6 @@ def poll_one(key, seen_file):
             edits.record_incoming(st, m, NICK)  # ids for others' messages
     except Exception as e:
         log_error(f"incoming record failed: {e}")
-    seen += len(msgs)
     try:
         with open(seen_file, "w") as f:
             f.write(str(seen))
@@ -75,7 +76,7 @@ def poll_one(key, seen_file):
         mark_seen(key, NICK, seen)  # read receipt; never breaks the poll
     except Exception as e:
         log_error(f"read-receipt write failed: {e}")
-    return msgs, new
+    return msgs, new, lost
 
 
 def main(argv=None):
@@ -100,7 +101,7 @@ def main(argv=None):
     for room in rooms:
         key = bus_key(room)
         try:
-            _, new = poll_one(key, seen_path(room))
+            _, new, lost = poll_one(key, seen_path(room))
         except FileNotFoundError:
             log_error("token file missing: " + TOKEN_FILE)
             print("RELAY_ERROR: token file missing")
@@ -110,6 +111,12 @@ def main(argv=None):
             print(f"RELAY_ERROR: {e}")
             return 2
         label = f"room '{room}'" if room else "main bus"
+        if lost:
+            msg = (f"{lost} message(s) in {label} were trimmed off the bus "
+                   f"before this poll read them (raise MUSE_RELAY_KEEP or "
+                   f"poll more often)")
+            log_error(msg)
+            print(f"WARNING: {msg}", file=sys.stderr)
         if args.announce:
             ann = announce.get_announcer(key)
             if ann is None:

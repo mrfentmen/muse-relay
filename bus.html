@@ -309,14 +309,59 @@ async function pollPresence() {
   } catch (e) { /* presence is best-effort; the log matters more */ }
 }
 
+// Trim-aware read window. LTRIM shifts every index down, so a raw index
+// cursor would skip whatever was trimmed out from under this tab — and
+// silently, with total loss for any gap bigger than MUSE_RELAY_KEEP.
+// The list carries a monotonic push counter at <key>:total that LTRIM
+// never touches, so (total - llen) is the absolute index of the oldest
+// kept message: anything below it is gone, and the tab says so instead
+// of pretending it saw everything. Same contract as
+// relay_common.bus_read on the Python side.
+// `start` is the absolute index of msgs[0]; `cursor` is where the next
+// read resumes; `lost` counts messages trimmed away before this read.
+async function readWindow() {
+  const key = busKey();
+  let total = null;
+  let llen = 0;
+  try {
+    const both = await Promise.all([
+      api("/get/" + key + ":total"), api("/llen/" + key)]);
+    total = both[0].result == null ? null : parseInt(both[0].result, 10);
+    llen = parseInt(both[1].result || "0", 10) || 0;
+  } catch (e) { /* no counter (pre-upgrade list): plain index below */ }
+  // LRANGE takes a position WITHIN the list, not an absolute index, so
+  // convert: rel = seen - first. When the tab was outrun, the oldest
+  // kept message is the earliest thing it can still see (rel = 0).
+  let rel = seen;
+  let lost = 0;
+  if (total != null && !isNaN(total) && total >= llen) {
+    const first = total - llen;
+    if (first > seen) { lost = first - seen; rel = 0; }
+    else rel = seen - first;
+  }
+  const start = seen + lost;   // absolute index of msgs[0]
+  if (rel >= llen) return { msgs: [], start, cursor: start, lost };
+  const data = await api("/lrange/" + key + "/" + rel + "/-1");
+  const msgs = data.result || [];
+  return { msgs, start, cursor: start + msgs.length, lost };
+}
+
 async function poll() {
   if (pollInFlight) return;
   pollInFlight = true;
   try {
-    const data = await api("/lrange/" + busKey() + "/" + seen + "/-1");
-    const msgs = data.result || [];
+    const win = await readWindow();
+    const msgs = win.msgs;
     const hint = $("hint");
     if (hint && (msgs.length || seen)) hint.remove();
+    if (win.lost) {
+      const warn = document.createElement("div");
+      warn.className = "msg";
+      warn.textContent = "\u26a0 " + win.lost + " message(s) were trimmed " +
+        "off the bus before this tab read them \u2014 raise " +
+        "MUSE_RELAY_KEEP or keep the tab fresher";
+      log.appendChild(warn);
+    }
     const fresh = [];
     for (let mi = 0; mi < msgs.length; mi++) {
       const m = msgs[mi];
@@ -324,7 +369,7 @@ async function poll() {
       const i = m.indexOf(":");
       const nick = i > 0 ? m.slice(0, i).trim() : "?";
       const text = i > 0 ? m.slice(i + 1).trim() : m;
-      const idx = seen + mi;  // absolute index in the list
+      const idx = win.start + mi;  // absolute index in the list
       const hl = highlightMentions(esc(text));
       const div = document.createElement("div");
       div.className = "msg" + (hl.mentionsYou ? " mentions-you" : "");
@@ -338,10 +383,8 @@ async function poll() {
       window.busUtil.runHooks("message", { nick, text, el: div, idx,
         room: busKey() });
     }
-    if (msgs.length) {
-      seen += msgs.length;
-      log.scrollTop = log.scrollHeight;
-    }
+    if (msgs.length) log.scrollTop = log.scrollHeight;
+    seen = win.cursor;
     if (!primed) {
       // First successful poll: history is loaded, let panels backfill.
       window.busUtil.runHooks("connect",

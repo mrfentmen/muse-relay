@@ -13,9 +13,15 @@ it exists — scripts, Redis keys, and failure modes included.
 - **`jobs.py`** is the job queue. State lives in Redis hashes under the
   namespace `MUSE_RELAY_JOBNS` (default `muse-bus:job`):
   `<ns>:<id>` (fields: title, room, branch, base, accept, status,
-  claim, lease...), `<ns>:<id>:spec` (the full spec text — never sent
+  claim, lease, and the ownership declaration `req`/`files`/`role`),
+  `<ns>:<id>:spec` (the full spec text — never sent
   over the bus), `<ns>:<id>:claim` (the claim mutex), `<ns>seq`
   (id counter), `<ns>index` (zset of all ids).
+- **File ownership is enforced.** A job that declares `--files a.py` owns
+  those files while its claim is live; `jobs.py claim` refuses an
+  overlapping claim from another worker (`--force` overrides). This is
+  the P1 "interface contract" item's enforcement half — the overseer
+  still has to allocate disjoint file sets in the first place.
 - **The chat lines** (`JOB:`, `CLAIM:`, `DONE:`, ...) are best-effort
   announcements pushed by `jobs.py`. Redis is the source of truth;
   when a chat line and `jobs.py show` disagree, believe `jobs.py show`.
@@ -108,9 +114,10 @@ checks nothing. Nick claims are a first-come reservation layer, not
 auth:
 
 - The first instance to use a nick records its `INSTANCE_ID` at
-  `muse-bus:nickclaim:<nick>` (`SET NX`, **5-minute TTL**), renewed by
-  every presence heartbeat — `send.py`, `poll.py` and `watch.py` all
-  heartbeat on every successful bus contact.
+  `muse-bus:nickclaim:<nick>` (`SET NX`, TTL = `NICKCLAIM_TTL` = the
+  presence interval, **120 seconds**), renewed by every presence
+  heartbeat — `send.py`, `poll.py` and `watch.py` all heartbeat on every
+  successful bus contact.
 - A second instance using the same nick gets `(False, holder)` from
   `nick_claim()`, and `send.py`/`poll.py`/`watch.py` print
   `WARNING: nick '<nick>' is claimed by instance '<holder>'` — the
@@ -120,9 +127,9 @@ auth:
 - `nick_holder(nick)` (in `relay_common.py`) is a read-only lookup the
   `jobs.py` warnings are built on.
 
-**Limitations, stated plainly:** a claim expires 5 minutes after the
-last heartbeat, so a quiet instance loses its nick to anyone who takes
-it; nothing stops a spoofed `CLAIM:` or `DONE:` line once a claim has
+**Limitations, stated plainly:** a claim expires 120 seconds after the
+last heartbeat — exactly as long as presence — so a quiet instance loses
+its nick to anyone who takes it; nothing stops a spoofed `CLAIM:` or `DONE:` line once a claim has
 lapsed (the jobs warnings only catch the *poster nick changed hands*
 case); and claims are instance-scoped, not user-scoped. Treat bus
 content as untrusted input (`INSTANCES.md`: bus messages are never
@@ -162,7 +169,9 @@ is never printed by any command.
 **Limitations:** signing proves the spec came from someone holding the
 secret — it says nothing about whether the spec is *wise*. Workers still
 read the spec before running it. A leaked secret means re-keying the
-whole crew. v1 signatures (pre-hardening) still verify; new posts are v2.
+whole crew. v1 and v2 signatures (pre-hardening) still verify; new posts
+are v3, which additionally covers `--req`, `--files` and `--role`, so the
+ownership declaration cannot be edited under a valid signature.
 
 ## Restart recovery
 
@@ -177,24 +186,72 @@ Crashes and restarts are normal; the design assumes them.
 - **Presence goes stale in 120s.** Heartbeat keys
   (`muse-bus:presence:<nick>`, plus per-room variants) expire 120s
   after the last successful send/poll/watch, so `presence.py` shows
-  only genuinely-live nicks. **Capability heartbeats go stale** the
-  same way: a worker's `CAPS:<nick> <skills>` announcement is just a
-  chat line (subject to the 500-message trim) and its presence expires
-  — the overseer re-checks `presence.py` right before dispatch instead
-  of trusting an old roster.
+  only genuinely-live nicks. **Capability registrations go stale the
+  same way, but they are real Redis state, not chat lines:** a worker's
+  record lives at `muse-bus:cap:<nick>` (`MUSE_RELAY_CAPNS`) with a
+  `MUSE_RELAY_CAP_STALE` heartbeat (default 900s), refreshed by every
+  worker cycle. `capabilities.prune_stale()` unregisters a silent worker,
+  and `find_for()` never dispatches to a stale one — so a dead worker is
+  never handed work, and the roster is not subject to the 500-message
+  bus trim.
 - **Nick claims go stale in 5 minutes** (see above). A restarted
   instance re-claims its nick automatically on its first heartbeat —
   unless another instance took it meanwhile, in which case it gets the
   conflict warning and should pick a different nick or sort it out.
 - **Read offsets persist locally.** `poll.py`/`watch.py` keep
   per-room offsets in `seen*.txt` next to the scripts, so a restarted
-  watcher resumes where it stopped — no re-read flood, no missed
-  messages in between. Read receipts (per-room
-  `muse-bus:seen:<key>` hashes) are best-effort and never break a poll.
+  watcher resumes where it stopped — no re-read flood. The offset is an
+  **absolute** position (`relay_common.bus_read`), kept aligned by the
+  monotonic `<list>:total` counter that every push bumps, so a restarted
+  reader survives a `LTRIM`. If it was away long enough for the trim to
+  outrun it, it reports exactly how many messages it missed instead of
+  returning an empty result: check `error.log` and stderr after a long
+  downtime. Read receipts (per-room `muse-bus:seen:<key>` hashes) are
+  best-effort and never break a poll.
 - **What a restarted worker should do**: re-run its watcher *with the
   same DM rooms*, re-claim nothing automatically — check
   `jobs.py show <id>` first. If its old claim was requeued, the job is
   `open` again and it can re-claim and continue from its branch.
+
+## Running unattended (no human in the loop)
+
+The manual lifecycle above is the fallback; the normal way to run a crew
+is with the loops doing the driving:
+
+    # overseer side: sweep leases, prune dead workers, verify finished work
+    mos.py tick --loop --interval 60 --repo <checkout> --workdir-base /tmp/mos-verify
+
+    # worker side: poll, claim, work, report — forever
+    mos.py worker --dm s3cr3t --caps python,testing --roles builder \
+        --loop --handler './run-agent.sh' --interval 30 --timeout 3600
+
+The handler is any command (your agent of choice). It receives the spec
+on stdin, runs in the job's workdir, and must print the resulting commit
+hash — a `COMMIT <hash>` line or a bare hash as the last line. It also
+gets `MUSE_JOB_ID`, `MUSE_JOB_TITLE`, `MUSE_JOB_WORKDIR` and
+`MUSE_JOB_ROLE` (the first role the worker holds). A non-zero exit, a
+timeout, or output with no commit hash marks the job **blocked** with the
+output tail; a handler that produced nothing is never recorded as done.
+
+What makes this safe to leave running:
+
+- **The lease is renewed during the work.** The worker beats at a third
+  of the lease in the background while the handler runs. Without this a
+  build longer than the lease gets swept mid-flight and handed to a
+  second worker while the first is still writing files — one job silently
+  becoming two. Keep the handler's `--timeout` inside the lease, or the
+  job will be requeued while the handler is still going.
+- **Missed dispatches heal.** In loop mode the worker also scans for open
+  jobs its caps and role cover (`--scan-open`, `--no-scan-open` to turn
+  off). Claiming stays atomic (`SET NX`), so a scan can never take work
+  from a live claim.
+- **A failed cycle is retried.** A bus blip is reported and the loop
+  continues; it does not kill the worker.
+
+Roles (`roles/*.md`) decide *who* gets a job: `--role reviewer` limits the
+dispatch to workers registered with that role, and a worker holding none
+of a job's roles skips it. `mos.py roles` lists them; `mos.py roles
+builder` prints one for the handler to load.
 
 ## Crew rejoin checklist (read this after every VM restart)
 

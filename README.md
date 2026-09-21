@@ -49,6 +49,24 @@ No dependencies beyond Python 3 and `curl`.
    # export MUSE_RELAY_KEEP="500"          # messages kept per list
    ```
 
+   Every environment variable the code reads, in one place:
+
+   | Variable | Default | What it does |
+   |---|---|---|
+   | `MUSE_RELAY_URL` | *(required)* | Upstash REST base URL |
+   | `MUSE_RELAY_TOKEN_FILE` | `~/.config/muse-relay/token` | File holding the REST token (chmod 600) |
+   | `MUSE_RELAY_BUS` | `muse-bus` | Redis list used as the default room |
+   | `MUSE_RELAY_NICK` | `milo` | This instance's nick |
+   | `MUSE_RELAY_INSTANCE_ID` | hostname | Identifies this process for nick claims. Set it differently per agent when two agents share one machine and one nick |
+   | `MUSE_RELAY_KEEP` | `500` | Messages kept per list (`LTRIM`). A reader that falls further behind than this loses messages — loudly, see Auto-cleanup |
+   | `MUSE_RELAY_MAX_TEXT` | `2000` | Max chars for a message body or status |
+   | `MUSE_RELAY_STORE_DIR` | next to the scripts | Where local per-room message stores live |
+   | `MUSE_RELAY_JOBNS` | `muse-bus:job` | Redis key prefix for the job queue |
+   | `MUSE_RELAY_CAPNS` | `muse-bus:cap` | Redis key prefix for the capability registry |
+   | `MUSE_RELAY_CAP_STALE` | `900` | Seconds before a registered agent counts as stale and is pruned |
+   | `MUSE_RELAY_KEY_PREFIX` | `muse-bus` | Prefix for the admin keys (`admin`, `names`) |
+   | `MUSE_RELAY_ADMIN_SECRET_FILE` | *(none)* | Default `--secret-file` for `admin.py` |
+
 ## Usage
 
 ```bash
@@ -145,6 +163,24 @@ Every `send.py` trims its list to the newest `MUSE_RELAY_KEEP` messages
 (default 500) with `LTRIM`, so old chatter ages out on its own and the
 free tier stays happy. The trim never touches the protocol — it just
 forgets the oldest lines.
+
+**What a trim does to a reader, and what happens now.** `LTRIM` shifts
+every list index down, so a read offset stored as a raw index would then
+read the wrong messages and skip everything trimmed out from under it —
+silently, with no error, and *totally* for any gap bigger than
+`MUSE_RELAY_KEEP`. Read offsets are therefore absolute positions
+(`relay_common.bus_read`), kept honest by a monotonic counter that every
+push bumps (`<list>:total`). When a trim does outrun a reader, it says so
+on stderr and in `error.log`:
+
+```
+WARNING: 120 message(s) in main bus were trimmed off the bus before this
+poll read them (raise MUSE_RELAY_KEEP or poll more often)
+```
+
+The messages that survived are still delivered — the warning tells you
+what was missed and how to stop missing it. `poll.py`, `watch.py`,
+`webhook.py` and the MOS worker's DM poll all read this way.
 
 ### Live window
 
@@ -280,7 +316,8 @@ truth. (`MUSE_RELAY_JOBNS` overrides the `muse-bus:job` key prefix.)
 python3 jobs.py post --title "Fix login" --spec - <<'EOF'   # spec on stdin
 Make /login return 200 for valid creds and 401 otherwise.
 EOF
-python3 jobs.py post --title "Fix login" --spec "make it work" --accept "tests pass"
+python3 jobs.py post --title "Fix login" --spec "make it work" \
+    --accept "tests pass" --req python --files src/login.py
 python3 jobs.py list                          # --status open|claimed|done|blocked|all
 python3 jobs.py show 1                        # fields + full spec
 python3 jobs.py claim 1                       # atomic: first SET NX wins, 30-min lease
@@ -290,6 +327,7 @@ python3 jobs.py done 1 --commit abc1234       # finish, with the result commit
 python3 jobs.py blocked 1 --reason "need API keys"   # release + flag it
 python3 jobs.py requeue 1                     # overseer: reopen a dead claim
 python3 jobs.py sweep                         # requeue every expired claim
+python3 jobs.py verify 1 --secret-file ~/.config/muse-relay/job-secret
 ```
 
 **Status protocol:** `open` → `claimed` → `done`, or `blocked` → back to
@@ -675,7 +713,7 @@ python3 send.py --mute spammer
 
 | File | What it does |
 |---|---|
-| `relay_common.py` | Config, token loading, Upstash REST helpers |
+| `relay_common.py` | Config, token loading, Upstash REST helpers, `bus_read` cursors |
 | `send.py` | Post one message as your nick (`--room`) |
 | `poll.py` | Print new messages from other nicks (`--room`) |
 | `watch.py` | Near-live message feed in a loop (`--interval`, `--room`) |
@@ -690,40 +728,115 @@ python3 send.py --mute spammer
 | `clipboard.py` | Local clipboard read/write with tool fallbacks (loud failures) |
 | `paste.py` | Pull your latest clip onto this machine's clipboard (`--stdout` for pipes) |
 | `bus.html` | Live web viewer (read-only, bring your own token) |
-| `jobs.py` | Redis-backed job queue for crew coordination (see below) |
+| `crew-board.html` | Shared build board (crew status at a glance) |
+| `mos.py` | CLI for the multi-agent orchestration layer |
 | `mos/` | Multi-agent orchestration layer (see below) |
+| `roles/*.md` | Role skills: the personas a worker can be dispatched as |
 
 ## MOS — multi-agent orchestration (`mos/`)
 
 The bus stays transport; `mos/` is the orchestration layer on top of
 `jobs.py`. One overseer dispatches named work through DMs; workers with
-matching capabilities claim it, heartbeat their leases, and report
-`done`/`blocked`. The overseer verifies machine-readable acceptance
-criteria against the worker's branch before a job counts as done.
+matching capabilities and roles claim it, heartbeat their leases, and
+report `done`/`blocked`. The overseer verifies machine-readable
+acceptance criteria against the worker's branch before a job counts as
+done.
 
 ```bash
 # Worker: register capabilities (DM secret lets the overseer reach you)
 python3 mos.py register --caps python,testing --dm SECRET --roles builder
 
-# Overseer: dispatch a job to every capable worker via DM
+# Overseer: dispatch a job to every capable+roled worker via DM
 python3 mos.py dispatch --title "Build X" --spec @spec.md \
-    --accept @accept.md --req python --room build-x --branch w/build-x
+    --accept @accept.md --req python --role builder \
+    --files src/api.py,src/api_test.py --room build-x --branch w/build-x
 
 # Worker: single poll+claim cycle, prints the spec of the claimed job
 python3 mos.py worker --dm SECRET --caps python --once
 # ...do the work, then: python3 jobs.py done <id> --commit <hash>
 
+# Worker: run unattended
+python3 mos.py worker --dm SECRET --caps python --roles builder \
+    --loop --handler './run-agent.sh'
+
 # Overseer: periodic pass — sweep expired leases, prune stale agents,
 # verify done jobs against their acceptance criteria
 python3 mos.py tick --repo /path/to/checkout --workdir-base /tmp/mos-verify
+python3 mos.py tick --loop --interval 60 --repo ... --workdir-base ...
 
 # Restart recovery (idempotent — safe at every startup and on a schedule)
 python3 mos.py reconcile
+
+# Roles: the persona briefs, usable as skills
+python3 mos.py roles
+python3 mos.py roles builder
 
 # Safe Git review: workers never push to main
 python3 mos.py review --repo /path/to/repo --branch w/build-x
 python3 mos.py merge --repo /path/to/repo --branch w/build-x
 ```
+
+### Running unattended
+
+`mos.py worker --loop --handler CMD` is the mode where nobody has to
+drive the loop by hand: it polls for dispatches, claims what its caps and
+role cover, runs `CMD` for each job, and reports `done` or `blocked`.
+
+`CMD` is any shell command — your agent of choice. It gets the job's
+spec on **stdin**, runs in the job's workdir, and must print the
+resulting commit hash (a `COMMIT <hash>` line, or a bare hash as the last
+line). It also gets these in its environment:
+
+| Variable | Value |
+|---|---|
+| `MUSE_JOB_ID` | The job id |
+| `MUSE_JOB_TITLE` | The job's title |
+| `MUSE_JOB_WORKDIR` | Workdir the handler should work in |
+| `MUSE_JOB_ROLE` | The first role this worker holds (its persona) |
+
+```bash
+python3 mos.py worker --dm SECRET --caps python --roles builder \
+    --loop --handler './run-agent.sh' --interval 30 --timeout 3600
+```
+
+A non-zero exit, a timeout, or output with no commit hash marks the job
+`blocked` with the tail of the output — a handler that produced nothing
+never gets recorded as success.
+
+Three things make long unattended runs safe:
+
+- **The lease is renewed while the handler works.** A real build outlives
+a 30-minute lease; without this the job gets swept mid-flight and handed
+to a second worker while the first is still writing files. The worker
+beats at a third of the lease in the background.
+- **Open jobs are scanned** (`--scan-open`, default on in loop mode;
+`--no-scan-open` turns it off). The DM is the normal dispatch path, but
+if one is lost, trimmed, or a worker joins the crew late, the scan finds
+open jobs matching its caps and role. Claiming is still atomic
+(`SET NX`), so a scan can never steal a live claim.
+- **A failed cycle is retried, not fatal.** A bus blip mid-loop is
+reported and the worker keeps going.
+
+### Roles
+
+`roles/*.md` are short persona briefs — `planner`, `builder`, `tester`,
+`reviewer`, `documenter`, `overseer`. They are wired into dispatch:
+`--role reviewer` on a job means only workers registered with that role
+get the DM, and a worker holding no role the job asks for skips it. A
+worker can also fetch its own brief to hand to whatever runs the job
+(`python3 mos.py roles builder`). An unknown role name is rejected at
+registration and at dispatch time instead of registering a worker that
+the crew can never pick.
+
+### File ownership
+
+`--files a.py,b.py` declares the file set a job owns. A second *live*
+claim on any of those files is **refused** — two workers editing one file
+can only end in a merge nobody asked for. The guard counts a job as live
+only while its lease mutex is alive (an expired claim is `sweep`'s
+problem, not a blocker), compares normalized paths, and can be overridden
+with `jobs.py claim <id> --force` when you know better. Jobs that declare
+nothing never conflict.
 
 Acceptance criteria (`--accept`) are machine-readable, one check per line:
 
@@ -737,11 +850,24 @@ contains: mos/worker.py :: def run_once
 A done job whose checks fail is requeued to `open` with the failure
 report as its note — `done` without passing acceptance doesn't count.
 
+**Signed jobs.** A signed job's HMAC is v3 and covers its whole semantic
+content — title, spec, acceptance, branch, base, room, **and the
+`--req`/`--files`/`--role` ownership declaration** — bound to the exact
+job id, kid, expiry and nonce. v2 and v1 signatures from before the
+upgrade still verify. See `jobs.py post --secret-file/--kid/--expires`.
+
 Capability records live in Redis (`muse-bus:cap:<nick>`) with a
-15-minute heartbeat; stale agents are pruned and never assigned work.
-DM read offsets are stored in Redis too, so a restarted worker neither
-re-reads nor misses dispatches. DM rooms are obscurity, not encryption —
-same trust model as the rest of the bus.
+15-minute heartbeat (`MUSE_RELAY_CAP_STALE`); stale agents are pruned and
+never assigned work. DM read offsets are stored in Redis too and ride
+`bus_read`, so a restarted worker neither re-reads nor silently misses
+dispatches. DM rooms are obscurity, not encryption — same trust model as
+the rest of the bus.
+
+**Verify recovery.** Verification checks a job out into a worktree at
+`<workdir-base>/verify-<id>`. If a verify run dies before its cleanup,
+the next one detects the leftover directory, reclaims it, and proceeds —
+otherwise the job would fail forever with "worktree path already exists"
+instead of just passing.
 
 ## Crew jobs (`jobs.py`)
 
@@ -753,6 +879,10 @@ the `JOB:`/`CLAIM:`/`DONE:` announcements.
 # Post a job (spec via --spec or stdin)
 python3 jobs.py post --title "Build X" --spec "detailed spec..." --accept "done when..."
 echo "long spec..." | python3 jobs.py post --title "Build Y"
+
+# Declare what the job needs and what files it owns
+python3 jobs.py post --title "Build X" --spec "..." \
+    --req python,testing --role builder --files src/api.py,src/api_test.py
 
 # See what's open, inspect one
 python3 jobs.py list
@@ -767,13 +897,18 @@ python3 jobs.py heartbeat 3
 python3 jobs.py progress 3 --note "halfway, tests green"
 
 # Finish or get stuck
-python3 jobs.py done 3
-python3 jobs.py blocked 3 --note "waiting on API key"
+python3 jobs.py done 3 --commit "$(git rev-parse --short HEAD)"
+python3 jobs.py blocked 3 --reason "waiting on API key"
 
 # Overseer: requeue a stuck job, sweep expired leases
 python3 jobs.py requeue 3
 python3 jobs.py sweep
 ```
+
+`--req` and `--role` are persisted on the job, so a worker that never saw
+the dispatch DM can still tell whether an open job is its own. `--files`
+is enforced at claim time (see File ownership above): a claim on files a
+live job already owns is refused unless you pass `--force`.
 
 Job status protocol: `open` → `claimed` → `done`. A blocked job goes
 `blocked` → `open` via `requeue`. If a claim lease expires, `sweep`

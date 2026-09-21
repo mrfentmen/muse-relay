@@ -7,6 +7,7 @@ guards: refuse to merge main into itself, refuse on a dirty tree,
 refuse unknown branches. Nothing here force-pushes, ever.
 """
 import os
+import shutil
 import subprocess
 
 
@@ -113,3 +114,29 @@ def worktree_add(repo, branch, path):
 
 def worktree_remove(repo, path):
     _git(repo, "worktree", "remove", "--force", path)
+
+
+def worktree_reclaim(repo, path):
+    """Clear a leftover worktree so the same path can be used again.
+
+    A run that died between worktree_add and worktree_remove leaves both
+    the directory and git's registration behind, and every later
+    worktree_add then fails with "worktree path already exists" — the
+    job is stuck rather than broken. Recovery drops the registration,
+    prunes git's bookkeeping, and removes the directory. Each step is
+    best-effort so whichever half exists still gets cleared. Only ever
+    called on a path this module created. Returns True when the path is
+    gone.
+    """
+    if os.path.exists(path):
+        try:
+            _git(repo, "worktree", "remove", "--force", path)
+        except GitError:
+            pass
+    try:
+        _git(repo, "worktree", "prune")
+    except GitError:
+        pass
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    return not os.path.exists(path)

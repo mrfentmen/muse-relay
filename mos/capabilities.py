@@ -119,43 +119,74 @@ def _fresh(record, now=None):
         return False
 
 
-def active_claims(nick):
-    """How many jobs this nick currently holds claimed."""
-    import jobs
-    import json
-    try:
-        ids = json.loads(rc.api_get(f"zrange/{jobs._index_key()}/0/-1"))["result"] or []
-    except Exception:
-        return 0
-    n = 0
-    for jid in ids:
-        h = jobs._hgetall(jobs._job_key(jid))
-        if h.get("status") == "claimed" and h.get("claim") == nick:
-            n += 1
-    return n
+def parse_list(value):
+    """Split a comma-separated registration field into a lowercase set."""
+    return {p.strip().lower() for p in (value or "").split(",") if p.strip()}
 
 
-def find_for(requirements):
-    """Nicks whose caps cover all requirements, fresh, with capacity.
+def roles_of(record):
+    """Roles a registered agent holds, lowercased (empty set when none)."""
+    return parse_list(record.get("roles"))
 
-    requirements: iterable of str. Returns sorted nick list."""
+
+def find_for(requirements, roles=None):
+    """Nicks matching a job: caps covered, role held, fresh, capacity.
+
+    requirements: iterable of str (all must be covered).
+    roles: optional iterable of str; a candidate must hold AT LEAST one.
+    Roles are what the roles/*.md skills describe (planner, builder,
+    reviewer, ...), so a job can ask for a reviewer rather than merely
+    for someone who happens to have the right capabilities.
+    Returns a sorted nick list.
+    """
     reqs = {r.strip().lower() for r in requirements if r and r.strip()}
+    want_roles = {r.strip().lower() for r in (roles or []) if r and r.strip()}
     now = time.time()
+    registrations = agents()
+    counts = active_claims_of(registrations.keys())
     out = []
-    for nick, rec in agents().items():
+    for nick, rec in registrations.items():
         if not _fresh(rec, now):
             continue
         caps = {c for c in rec.get("caps", "").split(",") if c}
         if not reqs.issubset(caps):
             continue
+        if want_roles and not (want_roles & roles_of(rec)):
+            continue
         try:
             max_jobs = int(rec.get("max_jobs", "1"))
         except ValueError:
             max_jobs = 1
-        if active_claims(nick) >= max(1, max_jobs):
+        if counts.get(nick, 0) >= max(1, max_jobs):
             continue
         out.append(nick)
     return sorted(out)
+
+
+def active_claims_of(nicks):
+    """Return {nick: claimed-job count} for the given nicks, in one pass.
+
+    find_for used to call active_claims() per candidate, which re-read
+    every job in the index for every agent (an N+1 over the job index).
+    One pass over the index answers it for the whole crew.
+    """
+    import jobs
+    want = set(nicks)
+    counts = {n: 0 for n in want}
+    if not want:
+        return counts
+    try:
+        ids = jobs._all_ids()
+    except Exception:
+        return counts
+    for jid in ids:
+        h = jobs._hgetall(jobs._job_key(jid))
+        if h.get("status") != "claimed":
+            continue
+        claim = h.get("claim")
+        if claim in counts:
+            counts[claim] += 1
+    return counts
 
 
 def prune_stale():

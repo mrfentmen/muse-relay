@@ -25,6 +25,9 @@ def _sha(path):
 
 
 class ParityTest(unittest.TestCase):
+    @unittest.skipUnless(os.path.isdir(SKILL_BIN),
+                         f"live skill not installed at {SKILL_BIN} "
+                         f"(parity only matters where it is)")
     def test_live_matches_vendored(self):
         for repo_rel, skill_name in PAIRS:
             repo_p = os.path.join(REPO, repo_rel)

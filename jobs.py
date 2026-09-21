@@ -9,9 +9,17 @@ chat. See ROADMAP.md ("the crew") for the full design.
 Usage:
   jobs.py post --title T --spec S|--spec - [--accept A] [--branch B]
                [--base C] [--room R] [--lease SECS]
+               [--req python,testing] [--files a.py,b.py]
   jobs.py list [--status open|claimed|done|blocked|all]
   jobs.py show <id>
-  jobs.py claim <id> [--room R] [--lease SECS]
+  jobs.py claim <id> [--room R] [--lease SECS] [--force]
+
+  --req persists the job's required capabilities and --files the files
+  it owns. --files is enforced: claiming a job whose declared files
+  overlap another LIVE job's is refused (--force overrides), because two
+  workers editing one file can only end in a merge nobody asked for.
+  --req is what lets a worker that missed the DM (or joined late) still
+  tell whether an open job is its own (see mos/worker.py scan_open).
   jobs.py heartbeat <id> [--lease SECS]
   jobs.py progress <id> --note TEXT [--room R]
   jobs.py done <id> --commit HASH [--note TEXT] [--room R]
@@ -23,6 +31,10 @@ Usage:
 Signed jobs (defense against spoofed overseers):
   jobs.py post ... --secret-file ~/.config/muse-relay/job-secret
   jobs.py claim <id> --secret-file ~/.config/muse-relay/job-secret
+
+  Signature versions: v3 is current and covers the job's semantic
+  content including --req and --files; v2 (no req/files) and v1 (no job
+  identity) still verify for jobs posted before the upgrade.
 
   The secret is a shared per-crew value distributed OUT OF BAND (your user
   tells both sides; never post it to the bus). The secret file is a keyring:
@@ -124,6 +136,73 @@ def _valid_id(jid):
     return jid.isdigit() and int(jid) > 0
 
 
+def _all_ids():
+    """Every job id, oldest first. Raises on transport failure."""
+    return json.loads(
+        api_get(f"zrange/{_index_key()}/0/-1"))["result"] or []
+
+
+def reqs_of(h):
+    """Capabilities a job requires (empty set when it names none).
+
+    Persisted at post time so a worker that never saw the DM — or joined
+    the crew after the dispatch — can still tell whether the job is
+    theirs to take.
+    """
+    return {r.strip().lower() for r in (h.get("req") or "").split(",") if r.strip()}
+
+
+def _norm_path(p):
+    """Normalize a declared file path so two spellings compare equal."""
+    return os.path.normpath(p.strip().lstrip("./")) if p.strip() else ""
+
+
+def files_of(h):
+    """Files a job declares as its own (empty set when it declares none)."""
+    return {p for p in (_norm_path(x) for x in (h.get("files") or "").split(","))
+            if p}
+
+
+def roles_of(h):
+    """Roles the job asks its worker to hold (empty set when none).
+
+    Roles name the role skills in roles/*.md, so a job can ask for a
+    reviewer rather than merely for someone with the right caps.
+    """
+    return {r.strip().lower() for r in (h.get("role") or "").split(",") if r.strip()}
+
+
+def _file_conflicts(jid, h):
+    """Other LIVE jobs whose declared files overlap this job's.
+
+    Two workers editing the same file cannot both be right, and the
+    overseer merges branches — so a claim on overlapping files is
+    refused instead of producing a conflict nobody asked for. A job only
+    conflicts while it is claimed AND its lease mutex is alive; a dead
+    lease is sweep's problem, not a blocker here.
+
+    Returns [(other_jid, [shared paths])].
+    """
+    mine = files_of(h)
+    if not mine:
+        return []
+    out = []
+    try:
+        ids = _all_ids()
+    except Exception:
+        return []  # unreadable index: don't block work on a lookup failure
+    for other in ids:
+        if str(other) == str(jid):
+            continue
+        oh = _hgetall(_job_key(other))
+        if oh.get("status") != "claimed" or _mutex_holder(other) is None:
+            continue
+        shared = sorted(mine & files_of(oh))
+        if shared:
+            out.append((str(other), shared))
+    return out
+
+
 # --- Signed jobs: HMAC-SHA256 over canonical job content -------------------
 #
 # Bus nicks are unauthenticated, so anyone can post JOB: as the overseer.
@@ -147,7 +226,7 @@ def _valid_id(jid):
 # signature cannot be transplanted onto another job. New posts are v2;
 # v1 signatures still verify for jobs posted before the upgrade.
 
-SIG_VERSION = "2"
+SIG_VERSION = "3"
 
 
 def _read_keyring(path):
@@ -224,8 +303,40 @@ def _sign_job_v1(secret, fields, spec):
                     hashlib.sha256).hexdigest()
 
 
+def _canonical_payload_v3(jid, kid, fields, spec):
+    """v3 payload: v2 plus the job's declared requirements and files.
+
+    Those two fields decide who may take the job and which files are
+    theirs, so a signature that ignored them would leave the ownership
+    declaration editable. v2 signatures still verify (see verify_job).
+    """
+    payload = {
+        "jid": str(jid),
+        "kid": str(kid),
+        "title": fields.get("title", ""),
+        "spec": spec,
+        "accept": fields.get("accept", ""),
+        "branch": fields.get("branch", ""),
+        "base": fields.get("base", ""),
+        "room": fields.get("room", ""),
+        "req": ",".join(sorted(reqs_of(fields))),
+        "files": ",".join(sorted(files_of(fields))),
+        "role": ",".join(sorted(roles_of(fields))),
+        "created_at": str(fields.get("created_at", "")),
+        "expires_at": str(fields.get("expires_at", "")),
+        "nonce": str(fields.get("nonce", "")),
+    }
+    return json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
 def _sign_job_v2(secret, jid, kid, fields, spec):
     return hmac.new(secret, _canonical_payload_v2(jid, kid, fields, spec),
+                    hashlib.sha256).hexdigest()
+
+
+def _sign_job_v3(secret, jid, kid, fields, spec):
+    return hmac.new(secret, _canonical_payload_v3(jid, kid, fields, spec),
                     hashlib.sha256).hexdigest()
 
 
@@ -250,7 +361,7 @@ def verify_job(jid, keyring):
         good = hmac.compare_digest(
             _sign_job_v1(secret, h, spec or ""), sig)
         return "OK" if good else "BAD"
-    if version != "2":
+    if version not in ("2", "3"):
         return "BAD"
     kid = h.get("sig_kid", "")
     secret = keyring.get(kid)
@@ -259,8 +370,8 @@ def verify_job(jid, keyring):
     exp = h.get("expires_at", "")
     if exp and int(time.time()) > int(exp):
         return "EXPIRED"
-    good = hmac.compare_digest(
-        _sign_job_v2(secret, jid, kid, h, spec or ""), sig)
+    sign = _sign_job_v3 if version == "3" else _sign_job_v2
+    good = hmac.compare_digest(sign(secret, jid, kid, h, spec or ""), sig)
     return "OK" if good else "BAD"
 
 
@@ -345,6 +456,12 @@ def cmd_post(args):
     if lease < 60:
         print("ERROR: --lease needs at least 60s", file=sys.stderr)
         return 2
+    reqs = sorted({r.strip().lower()
+                   for r in (args.req or "").split(",") if r.strip()})
+    files = sorted({_norm_path(f)
+                    for f in (args.files or "").split(",") if f.strip()})
+    job_roles = sorted({r.strip().lower()
+                        for r in (args.role or "").split(",") if r.strip()})
     try:
         jid = str(json.loads(api_get(f"incr/{_seq_key()}"))["result"])
         now = int(time.time())
@@ -352,7 +469,8 @@ def cmd_post(args):
             "title": args.title, "room": room, "branch": args.branch,
             "base": args.base, "accept": args.accept, "status": "open",
             "lease": lease, "created_by": NICK, "created_host": INSTANCE_ID,
-            "created_at": now,
+            "created_at": now, "req": ",".join(reqs),
+            "files": ",".join(files), "role": ",".join(job_roles),
         }
         _hset(_job_key(jid), fields)
         api_post(f"set/{_spec_key(jid)}", spec)
@@ -383,7 +501,7 @@ def cmd_post(args):
         sig_fields["expires_at"] = expires_at
         try:
             _hset(_job_key(jid), {
-                "sig": _sign_job_v2(secret, jid, kid, sig_fields, spec),
+                "sig": _sign_job_v3(secret, jid, kid, sig_fields, spec),
                 "sig_v": SIG_VERSION,
                 "sig_kid": kid,
                 "signed_by": NICK,
@@ -401,7 +519,7 @@ def cmd_post(args):
 
 def cmd_list(args):
     try:
-        ids = json.loads(api_get(f"zrange/{_index_key()}/0/-1"))["result"] or []
+        ids = _all_ids()
     except Exception as e:
         print(f"RELAY_ERROR: list failed ({e})", file=sys.stderr)
         return 2
@@ -429,10 +547,10 @@ def cmd_show(args):
         print(f"ERROR: no such job: {args.id}", file=sys.stderr)
         return 2
     for f in ("title", "status", "room", "branch", "base", "accept",
-              "claim", "claim_host", "claimed_at", "lease_until",
-              "result_commit", "note", "created_by", "created_host",
-              "created_at", "lease", "signed_by", "sig_v", "sig_kid",
-              "expires_at", "nonce"):
+              "req", "files", "role", "claim", "claim_host", "claimed_at",
+              "lease_until", "result_commit", "note", "created_by",
+              "created_host", "created_at", "lease", "signed_by",
+              "sig_v", "sig_kid", "expires_at", "nonce"):
         if h.get(f):
             print(f"{f}: {h[f]}")
     w = _creator_warning(h)
@@ -489,6 +607,19 @@ def cmd_claim(args):
                  if h.get("status") == "claimed" else ""),
               file=sys.stderr)
         return 2
+    # File-ownership guard: a job that declares files owns them while it
+    # is live, so two workers never get dispatched onto the same file.
+    if not args.force:
+        conflicts = _file_conflicts(args.id, h)
+        if conflicts:
+            for other, shared in conflicts:
+                print(f"ERROR: job {args.id} declares file(s) already "
+                      f"held by live job {other}: {', '.join(shared)}",
+                      file=sys.stderr)
+            print("ERROR: refusing the claim — wait for the other job to "
+                  "finish, split the work, or re-claim with --force",
+                  file=sys.stderr)
+            return 2
     lease = args.lease
     if lease < 60:
         print("ERROR: --lease needs at least 60s", file=sys.stderr)
@@ -665,7 +796,7 @@ def cmd_requeue(args):
 
 def cmd_sweep(args):
     try:
-        ids = json.loads(api_get(f"zrange/{_index_key()}/0/-1"))["result"] or []
+        ids = _all_ids()
     except Exception as e:
         print(f"RELAY_ERROR: sweep failed ({e})", file=sys.stderr)
         return 2
@@ -698,6 +829,15 @@ def main(argv=None):
     p.add_argument("--branch", default="", help="worker branch name")
     p.add_argument("--base", default="", help="base commit")
     p.add_argument("--room", default="", help="announce room")
+    p.add_argument("--req", default="",
+                   help="required caps, comma-separated (persisted so a "
+                        "worker that missed the DM can still match)")
+    p.add_argument("--files", default="",
+                   help="files this job owns, comma-separated; a second "
+                        "live job claiming any of them is refused")
+    p.add_argument("--role", default="",
+                   help="role skills the worker should hold "
+                        "(see roles/), comma-separated")
     p.add_argument("--lease", type=int, default=LEASE_DEFAULT)
     p.add_argument("--secret-file", default="",
                    help="sign the job with this crew secret (HMAC-SHA256)")
@@ -723,6 +863,9 @@ def main(argv=None):
     p.add_argument("--secret-file", default="",
                    help="verify a signed job's HMAC before claiming; "
                         "refuses on BAD signature")
+    p.add_argument("--force", action="store_true",
+                   help="claim even when another live job owns one of "
+                        "this job's declared files")
     p.set_defaults(fn=cmd_claim)
 
     p = sub.add_parser("heartbeat", help="renew the claim lease")

@@ -4,14 +4,22 @@
 Usage:
   mos.py register --caps python,testing --dm SECRET [--roles builder]
   mos.py caps
+  mos.py roles [NAME]              # list role skills, or print one
   mos.py dispatch --title T --spec SPEC [--accept ACCEPT] [--req python]
+                  [--role builder] [--files a.py,b.py]
                   [--room R] [--lease SECS] [--branch B]
-  mos.py tick [--repo PATH --workdir-base PATH]
+  mos.py tick [--repo PATH --workdir-base PATH] [--loop --interval SECS]
   mos.py verify <jid> [--repo PATH --workdir-base PATH]
   mos.py worker --dm SECRET --caps python [--once]
+  mos.py worker --dm SECRET --caps python --loop --handler 'CMD'
+                [--interval SECS] [--max-cycles N] [--scan-open]
   mos.py reconcile
   mos.py review --repo PATH --branch B [--base main]
   mos.py merge --repo PATH --branch B [--base main]
+
+`worker --loop --handler CMD` is the autonomous mode: it polls, claims
+jobs its caps and role cover, runs CMD for each one, and reports
+done/blocked. See mos/worker.py CommandHandler for what CMD is handed.
 
 Spec/accept may be given inline or via @file. Never prints the token.
 """
@@ -22,6 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import relay_common as rc  # noqa: E402
 from mos import capabilities, gitops, overseer, reconcile, worker  # noqa: E402
+from mos import roles as roles_mod  # noqa: E402
 
 
 def _text(v):
@@ -33,9 +42,30 @@ def _text(v):
 
 def cmd_register(a):
     caps = [c for c in (a.caps or "").split(",") if c.strip()]
-    capabilities.register(rc.NICK, caps, roles=a.roles or "",
-                          max_jobs=a.max_jobs, dm_secret=a.dm or "")
+    try:
+        capabilities.register(rc.NICK, caps, roles=a.roles or "",
+                              max_jobs=a.max_jobs, dm_secret=a.dm or "")
+    except ValueError as e:  # e.g. --caps with nothing usable in it
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print(f"REGISTERED {rc.NICK}: {','.join(sorted(caps))}")
+    return 0
+
+
+def cmd_roles(a):
+    names = roles_mod.list_roles()
+    if not a.name:
+        if not names:
+            print("NO_ROLES")
+            return 0
+        for name in names:
+            print(name)
+        return 0
+    try:
+        print(roles_mod.load_role(a.name), end="")
+    except roles_mod.RoleError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -53,10 +83,16 @@ def cmd_caps(a):
 
 def cmd_dispatch(a):
     reqs = [r for r in (a.req or "").split(",") if r.strip()]
-    jid, dms = overseer.dispatch(
-        a.title, _text(a.spec), accept=_text(a.accept), requirements=reqs,
-        room=a.room or "", lease=a.lease, branch=a.branch or "",
-        base=a.base or "")
+    wants = [r for r in (a.role or "").split(",") if r.strip()]
+    try:
+        jid, dms = overseer.dispatch(
+            a.title, _text(a.spec), accept=_text(a.accept),
+            requirements=reqs, room=a.room or "", lease=a.lease,
+            branch=a.branch or "", base=a.base or "", roles=wants,
+            files=a.files or "")
+    except ValueError as e:  # e.g. an empty --spec
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print(f"DISPATCHED {jid}")
     for nick, ok, detail in dms:
         print(f"  DM {nick}: {'OK' if ok else 'FAIL'} {detail}")
@@ -66,20 +102,15 @@ def cmd_dispatch(a):
 
 
 def cmd_tick(a):
+    if a.loop:
+        overseer.tick_loop(repo=a.repo, workdir_base=a.workdir_base,
+                           interval=a.interval, max_cycles=a.max_cycles)
+        return 0
     rep = overseer.tick(repo=a.repo, workdir_base=a.workdir_base)
-    for jid in rep["swept"]:
-        print(f"SWEPT {jid}")
-    for nick in rep["pruned"]:
-        print(f"PRUNED {nick}")
-    for jid in rep["verified"]:
-        print(f"VERIFIED {jid}")
-    for jid in rep["failed"]:
-        print(f"ACCEPTANCE_FAILED {jid}")
+    for line in overseer.tick_lines(rep):
+        print(line)
     for e in rep["errors"]:
         print(f"ERROR {e}", file=sys.stderr)
-    if not any([rep["swept"], rep["pruned"], rep["verified"],
-                rep["failed"], rep["errors"]]):
-        print("TICK_CLEAN")
     return 0 if not rep["errors"] else 2
 
 
@@ -92,12 +123,36 @@ def cmd_verify(a):
 
 
 def cmd_worker(a):
+    # Validate arguments before touching Redis: a missing --handler is a
+    # usage error, not a reason to register anything.
+    if a.loop and not (a.handler or "").strip():
+        print("ERROR: --loop needs --handler CMD — the command that does "
+              "the work for each claimed job", file=sys.stderr)
+        return 2
     caps = [c for c in (a.caps or "").split(",") if c.strip()]
-    w = worker.Worker(dm_secret=a.dm or "", caps=caps,
-                      roles=a.roles or "", workdir=a.workdir or ".",
-                      lease=a.lease)
+    scan = a.scan_open or (a.loop and not a.no_scan_open)
+    try:
+        w = worker.Worker(dm_secret=a.dm or "", caps=caps,
+                          roles=a.roles or "", workdir=a.workdir or ".",
+                          lease=a.lease, scan_open=scan)
+    except roles_mod.RoleError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     w.register()
     w.heartbeat()
+    if a.loop:
+        # The blank-command case was rejected above, so this cannot raise;
+        # the role comes from the worker so the handler runs the persona
+        # the worker registered as (MUSE_JOB_ROLE).
+        handler = worker.CommandHandler(
+            a.handler, workdir=a.workdir or ".",
+            role=next(iter(w.role_set), ""), timeout=a.timeout)
+        print(f"worker {rc.NICK}: looping every {a.interval:g}s, "
+              f"caps={','.join(sorted(w.caps))}"
+              + (f", roles={w.roles}" if w.roles else "")
+              + (", scanning open jobs" if w.scan_open else ""), flush=True)
+        w.run_loop(handler, interval=a.interval, max_cycles=a.max_cycles)
+        return 0
     if a.once:
         found = w.poll_dms()
         claimed = None
@@ -117,9 +172,12 @@ def cmd_worker(a):
         if not claimed and not found:
             print("NO_DISPATCHES")
         return 0
-    # loop mode: the caller is the handler (an agent driving this CLI)
-    print("worker loop: agent-driven; use --once per cycle", file=sys.stderr)
-    return 2
+    # No --once and no --loop: the shared registration state (register +
+    # heartbeat) is already written, so an agent driving this CLI cycle
+    # by cycle can just call --once. Be explicit about it.
+    print("registered + heartbeated; pass --once for one cycle, or "
+          "--loop --handler CMD to run unattended", file=sys.stderr)
+    return 0
 
 
 def cmd_reconcile(a):
@@ -165,20 +223,38 @@ def main(argv=None):
     p = sub.add_parser("caps", help="list registered agents")
     p.set_defaults(fn=cmd_caps)
 
+    p = sub.add_parser("roles", help="list role skills, or print one")
+    p.add_argument("name", nargs="?", default=None,
+                   help="role to print (see roles/*.md); omit to list")
+    p.set_defaults(fn=cmd_roles)
+
     p = sub.add_parser("dispatch", help="post a job + DM capable workers")
     p.add_argument("--title", required=True)
     p.add_argument("--spec", required=True, help="text or @file")
     p.add_argument("--accept", default="", help="text or @file")
     p.add_argument("--req", default="", help="required caps, comma-sep")
+    p.add_argument("--role", default="",
+                   help="role skills the worker must hold (roles/*.md), "
+                        "comma-sep; a worker must hold at least one")
+    p.add_argument("--files", default="",
+                   help="files this job owns, comma-sep; claimed by two "
+                        "live jobs is refused")
     p.add_argument("--room", default="")
     p.add_argument("--lease", type=int, default=1800)
     p.add_argument("--branch", default="")
     p.add_argument("--base", default="")
     p.set_defaults(fn=cmd_dispatch)
 
-    p = sub.add_parser("tick", help="one overseer pass")
+    p = sub.add_parser("tick", help="one overseer pass (or a continuous loop)")
     p.add_argument("--repo", default=None)
     p.add_argument("--workdir-base", default=None)
+    p.add_argument("--loop", action="store_true",
+                   help="keep ticking (sweep leases, prune, verify) "
+                        "until interrupted")
+    p.add_argument("--interval", type=float, default=60,
+                   help="seconds between ticks in --loop mode")
+    p.add_argument("--max-cycles", type=int, default=None,
+                   help="stop after N cycles (mainly for tests)")
     p.set_defaults(fn=cmd_tick)
 
     p = sub.add_parser("verify", help="verify a done job's acceptance")
@@ -190,11 +266,27 @@ def main(argv=None):
     p = sub.add_parser("worker", help="worker poll/claim cycle")
     p.add_argument("--dm", default="", help="DM dead-drop secret")
     p.add_argument("--caps", default="", help="comma-separated")
-    p.add_argument("--roles", default="")
+    p.add_argument("--roles", default="", help="role skills to work as")
     p.add_argument("--workdir", default=".")
     p.add_argument("--lease", type=int, default=1800)
     p.add_argument("--once", action="store_true",
                    help="single poll+claim cycle, print spec")
+    p.add_argument("--loop", action="store_true",
+                   help="run unattended until interrupted (needs --handler)")
+    p.add_argument("--handler", default="",
+                   help="command that does a job's work; gets the spec on "
+                        "stdin and must print the commit hash")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="seconds before a handler run is killed and the "
+                        "job marked blocked")
+    p.add_argument("--interval", type=float, default=60,
+                   help="seconds between poll cycles (default: 60)")
+    p.add_argument("--max-cycles", type=int, default=None,
+                   help="stop after N cycles (mainly for tests)")
+    p.add_argument("--scan-open", action="store_true",
+                   help="also take open jobs nobody DMed about")
+    p.add_argument("--no-scan-open", action="store_true",
+                   help="in --loop mode, do not scan open jobs")
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("reconcile", help="restart recovery")
@@ -213,6 +305,16 @@ def main(argv=None):
     p.set_defaults(fn=cmd_merge)
 
     args = ap.parse_args(argv)
+    # A role name that matches no role skill would register or dispatch a
+    # worker that can never be picked. Fail loudly, before any state change.
+    for attr in ("roles", "role"):
+        if hasattr(args, attr) and getattr(args, attr):
+            try:
+                setattr(args, attr, ",".join(
+                    roles_mod.parse_roles(getattr(args, attr))))
+            except roles_mod.RoleError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
     return args.fn(args)
 
 

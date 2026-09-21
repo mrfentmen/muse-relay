@@ -39,7 +39,8 @@ def _say(room, text):
         print(f"WARNING: announce failed ({e})", file=sys.stderr)
 
 
-def _post_job(title, spec, accept, room, lease, branch, base):
+def _post_job(title, spec, accept, room, lease, branch, base, reqs=(),
+              files="", roles=()):
     """Post via jobs.main, capturing the new job id."""
     argv = ["post", "--title", title, "--spec", spec, "--lease", str(lease)]
     if accept:
@@ -50,6 +51,12 @@ def _post_job(title, spec, accept, room, lease, branch, base):
         argv += ["--branch", branch]
     if base:
         argv += ["--base", base]
+    if reqs:
+        argv += ["--req", ",".join(reqs)]
+    if files:
+        argv += ["--files", files]
+    if roles:
+        argv += ["--role", ",".join(roles)]
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc_code = jobs.main(argv)
@@ -62,18 +69,22 @@ def _post_job(title, spec, accept, room, lease, branch, base):
 
 
 def dispatch(title, spec, accept="", requirements=(), room="",
-             lease=LEASE_DEFAULT, branch="", base=""):
-    """Post a job and DM every capable worker.
+             lease=LEASE_DEFAULT, branch="", base="", roles=(), files=""):
+    """Post a job and DM every worker whose caps and role fit it.
 
+    `files` declares the file set the job owns; jobs.py enforces it at
+    claim time so two workers never get handed the same file.
     Returns (jid, dm_results) where dm_results is
     [(nick, dm_ok, detail)].
     """
     if not spec or not spec.strip():
         raise ValueError("spec must not be empty")
     reqs = [r.strip().lower() for r in requirements if r and r.strip()]
-    jid = _post_job(title, spec, accept, room, lease, branch, base)
+    want_roles = [r.strip().lower() for r in roles if r and r.strip()]
+    jid = _post_job(title, spec, accept, room, lease, branch, base,
+                    reqs=reqs, files=files, roles=want_roles)
     dm_results = []
-    for nick in capabilities.find_for(reqs):
+    for nick in capabilities.find_for(reqs, roles=want_roles):
         rec = capabilities.get(nick) or {}
         secret = rec.get("dm", "")
         if not secret:
@@ -82,6 +93,8 @@ def dispatch(title, spec, accept="", requirements=(), room="",
         text = f"JOB:{jid} {title}"
         if reqs:
             text += f" req={','.join(reqs)}"
+        if want_roles:
+            text += f" role={','.join(want_roles)}"
         buf, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(buf), \
                 contextlib.redirect_stderr(err):
@@ -125,6 +138,14 @@ def verify_done(jid, repo=None, workdir_base=None):
     try:
         if repo and branch and workdir_base:
             wt_path = os.path.join(workdir_base, f"verify-{jid}")
+            if os.path.exists(wt_path):
+                # A previous verify died before its cleanup, leaving the
+                # worktree registration and directory behind. Without
+                # this the job would fail forever with "worktree path
+                # already exists" — a stuck job, not a failing one.
+                print(f"WARNING: reclaiming stale worktree {wt_path}",
+                      file=sys.stderr)
+                gitops.worktree_reclaim(repo, wt_path)
             gitops.worktree_add(repo, branch, wt_path)
             workdir = wt_path
         ok, results = acceptance.verify(h.get("accept", ""), workdir)
@@ -193,3 +214,51 @@ def tick(repo=None, workdir_base=None):
         except Exception as e:
             report["errors"].append(f"verify {jid}: {e}")
     return report
+
+
+def tick_lines(rep):
+    """Render a tick report as one line per event; ['TICK_CLEAN'] when
+    nothing happened. Shared by the CLI and the loop so both print the
+    same thing."""
+    lines = [f"SWEPT {jid}" for jid in rep["swept"]]
+    lines += [f"PRUNED {nick}" for nick in rep["pruned"]]
+    lines += [f"VERIFIED {jid}" for jid in rep["verified"]]
+    lines += [f"ACCEPTANCE_FAILED {jid}" for jid in rep["failed"]]
+    return lines or ["TICK_CLEAN"]
+
+
+def _report_tick(rep, out):
+    """Print one tick report: events on out, errors on stderr."""
+    for line in tick_lines(rep):
+        print(line, file=out, flush=True)
+    for e in rep["errors"]:
+        print(f"ERROR {e}", file=sys.stderr)
+
+
+def tick_loop(repo=None, workdir_base=None, interval=60, max_cycles=None,
+              out=None):
+    """Run tick() repeatedly — the overseer's autonomous mode.
+
+    Sweeping leases, pruning dead registrations and verifying finished
+    work are things nobody should have to remember to run by hand. A
+    failed cycle is reported and retried rather than killing the loop,
+    because the bus being briefly unreachable must not stop the crew.
+    Returns the number of cycles completed.
+    """
+    out = out or sys.stdout
+    cycles = 0
+    try:
+        while True:
+            try:
+                rep = tick(repo=repo, workdir_base=workdir_base)
+                _report_tick(rep, out)
+            except Exception as e:
+                print(f"WARNING: overseer tick failed ({e}); retrying",
+                      file=sys.stderr)
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                return cycles
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\noverseer stopping", file=sys.stderr)
+        return cycles

@@ -24,7 +24,10 @@ import tempfile
 import unittest
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
-import dynamic_credentials as dc  # noqa: E402
+try:
+    import dynamic_credentials as dc  # noqa: E402
+except ImportError:  # helper lives outside the repo; absent elsewhere
+    dc = None
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 URL = "https://upright-mosquito-285786.upstash.io"
@@ -40,6 +43,10 @@ def _upstash_token():
 class AdminE2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if dc is None:
+            raise unittest.SkipTest(
+                "needs the skill-creator dynamic_credentials helper "
+                "(/opt/hatch/skills/skill-creator/bin)")
         cls.tmp = tempfile.mkdtemp(prefix="busadmin-e2e-")
         cls.secret_file = os.path.join(cls.tmp, "admin_secret")
         with open(cls.secret_file, "wb") as f:
@@ -50,8 +57,14 @@ class AdminE2E(unittest.TestCase):
             f.write(secrets.token_bytes(32))
         os.chmod(cls.wrong_secret, 0o600)
         cls.token_file = os.path.join(cls.tmp, "token")
+        try:
+            token = _upstash_token()
+        except Exception as e:
+            raise unittest.SkipTest(
+                f"needs the custom.upstash-muse-bus credential and the "
+                f"network: {e}")
         with open(cls.token_file, "w") as f:
-            f.write(_upstash_token())
+            f.write(token)
         os.chmod(cls.token_file, 0o600)
         cls.env = dict(os.environ,
                        MUSE_RELAY_URL=URL,

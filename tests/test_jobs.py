@@ -438,7 +438,7 @@ class HardeningTest(RelayTestCase):
         self.post_signed()
         h, _ = jobs.job_get("1")
         self.assertEqual(h["sig_kid"], "crew-2026-09")
-        self.assertEqual(h["sig_v"], "2")
+        self.assertEqual(h["sig_v"], jobs.SIG_VERSION)
         self.assertTrue(h["nonce"])
         rc, out, err = self.run_cli(
             jobs.main, ["verify", "1", "--secret-file", self.keyring])
@@ -500,6 +500,35 @@ class HardeningTest(RelayTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "OK")
 
+    def test_v2_signature_still_verifies(self):
+        # Jobs posted before the req/files/role payload (v2) must keep
+        # verifying — an upgrade cannot invalidate the crew's queue.
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        h, _ = jobs.job_get("1")
+        jobs._hset(jobs._job_key("1"), {
+            "sig": jobs._sign_job_v2(b"crew-secret-abc", "1",
+                                     "crew-2026-09", h, "s"),
+            "sig_v": "2", "sig_kid": "crew-2026-09", "signed_by": "tester"})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_files_reqs_and_role_are_covered_by_the_signature(self):
+        # The ownership declaration decides who takes the job and which
+        # files are theirs, so v3 signs it: widening a signed job's file
+        # claim must invalidate the signature, not silently take effect.
+        self.post_signed("--files", "a.py", "--req", "python",
+                         "--role", "builder")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(out.strip(), "OK")
+        jobs._hset(jobs._job_key("1"), {"files": "b.py"})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
     def test_expiry(self):
         self.post_signed("--expires", "3600")
         rc, out, _ = self.run_cli(
@@ -539,7 +568,8 @@ class HardeningTest(RelayTestCase):
         self.post_signed()
         h1, _ = jobs.job_get("1")
         jobs._hset(jobs._job_key("2"), {
-            "sig": h1["sig"], "sig_v": "2", "sig_kid": h1["sig_kid"],
+            "sig": h1["sig"], "sig_v": h1["sig_v"],
+            "sig_kid": h1["sig_kid"],
             "signed_by": h1["signed_by"], "nonce": h1["nonce"],
             "expires_at": h1.get("expires_at", "")})
         rc, out, _ = self.run_cli(
@@ -552,7 +582,7 @@ class HardeningTest(RelayTestCase):
         rc, out, _ = self.run_cli(jobs.main, ["show", "1"])
         self.assertEqual(rc, 0)
         self.assertIn("sig_kid: crew-2026-09", out)
-        self.assertIn("sig_v: 2", out)
+        self.assertIn(f"sig_v: {jobs.SIG_VERSION}", out)
         self.assertIn("nonce: ", out)
 
     def test_unsigned_claim_still_allowed_with_warning(self):

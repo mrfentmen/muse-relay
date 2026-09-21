@@ -1,6 +1,7 @@
 """Shared fixtures for muse-relay unit tests."""
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,35 @@ import timecapsule  # noqa: E402
 import export  # noqa: E402
 import webhook  # noqa: E402
 from fake_redis import FakeUpstash  # noqa: E402
+
+
+def make_git_repo(path, branch="worker/thing"):
+    """Create a real git repo with a committed worker branch.
+
+    mos/gitops.py shells out to git and tests its real behavior (worktree
+    add/remove/reclaim), so there is nothing to fake here. `branch=None`
+    gives a repo with only main. Returns path.
+    """
+    def git(*args):
+        subprocess.run(["git", "-C", path] + list(args), check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    os.makedirs(path, exist_ok=True)
+    git("init", "-b", "main")
+    git("config", "user.email", "t@t.t")
+    git("config", "user.name", "t")
+    with open(os.path.join(path, "a.txt"), "w") as f:
+        f.write("v1\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    if branch:
+        git("checkout", "-b", branch)
+        with open(os.path.join(path, "b.txt"), "w") as f:
+            f.write("new\n")
+        git("add", ".")
+        git("commit", "-m", "worker commit")
+        git("checkout", "main")
+    return path
 
 
 class RelayTestCase(unittest.TestCase):

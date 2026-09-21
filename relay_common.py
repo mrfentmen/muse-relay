@@ -385,6 +385,68 @@ def bus_get(start, stop, key=None):
     return data.get("result", []) or []
 
 
+def bus_llen(key=None):
+    """Number of messages currently in a bus list."""
+    data = json.loads(api_get(f"llen/{key or BUS}"))
+    return int(data.get("result") or 0)
+
+
+def bus_total(key=None):
+    """Total messages EVER pushed to a bus list, or None when unknown.
+
+    bus_push INCRs <key>:total alongside every RPUSH, so the counter is
+    monotonic and LTRIM never touches it. A list written before the
+    counter existed reads as None and callers fall back to plain index
+    behavior. Returns None (rather than 0) so "no counter" and "empty
+    list" stay distinguishable. Never raises.
+    """
+    try:
+        raw = json.loads(api_get(f"get/{key or BUS}:total")).get("result")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def bus_read(consumed, key=None):
+    """Read bus messages after an absolute cursor; detect trimmed loss.
+
+    The list is capped by bus_trim (LTRIM), which shifts every index
+    down. A cursor stored as a raw list index then reads the wrong
+    messages and silently skips everything trimmed out from under it —
+    and any gap bigger than MUSE_RELAY_KEEP is total loss. Callers must
+    use this instead of bus_get(seen, -1) so a trim is visible.
+
+    `consumed` is an ABSOLUTE count: how many messages this reader has
+    taken since the list was created. That is exactly what the plain
+    integer in a seen file has always meant, so existing cursors keep
+    working. Returns (messages, next_cursor, lost) where `lost` is the
+    number of messages trimmed away before this reader reached them
+    (0 when the reader is caught up). next_cursor always moves forward.
+
+    Falls back to plain index semantics — no loss detection — when the
+    list has no total counter (nothing was ever trimmed from it, or it
+    predates the counter).
+    """
+    llen = bus_llen(key)
+    total = bus_total(key)
+    if total is None or total < llen:
+        msgs = bus_get(consumed, -1, key=key)
+        return msgs, consumed + len(msgs), 0
+    if total < consumed:  # counter reset; never move the cursor back
+        total = consumed
+    first = total - llen      # absolute index of the oldest kept message
+    lost = max(0, first - consumed)
+    start = max(0, consumed - first)
+    if start >= llen:
+        return [], total, lost
+    return bus_get(start, -1, key=key), total, lost
+
+
 def bus_trim(key=None, keep=None):
     """Trim a bus list to the newest `keep` messages (default KEEP_MESSAGES).
 
@@ -418,10 +480,21 @@ def bus_push(body, key=None):
             time.sleep(2)
             continue
         if p.returncode == 0 and p.stdout.strip():
+            _bump_total(key)
             return p.stdout
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
         time.sleep(2)
     raise RuntimeError(f"push failed after 4 attempts: {last_err}")
+
+
+def _bump_total(key):
+    """Best-effort: keep <key>:total in step with every RPUSH (see
+    bus_total/bus_read). A missed bump only degrades loss reporting to
+    the plain-index fallback; it never breaks a send."""
+    try:
+        api_get(f"incr/{key or BUS}:total")
+    except Exception:
+        pass
 
 
 def api_post(path, body):

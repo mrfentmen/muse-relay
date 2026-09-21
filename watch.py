@@ -25,7 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    NICK, TOKEN_FILE, bus_get, bus_key, clean_room, dm_room, mark_seen,
+    NICK, TOKEN_FILE, bus_key, bus_read, clean_room, dm_room, mark_seen,
     nick_conflict_holder, own_prefixes, presence_beat, seen_path)
 import edits  # noqa: E402
 import store  # noqa: E402
@@ -60,7 +60,15 @@ def watch_once(targets, announce_only=False):
     shown = 0
     for t in targets:
         label, key, seen_file, seen = t
-        msgs = bus_get(seen, -1, key=key)
+        # bus_read advances the cursor by the REAL message count and
+        # reports anything trimmed off the bus. Advancing by the count of
+        # lines we happened to print (the old bug) replayed the
+        # announcer's messages every cycle in --announce mode.
+        msgs, cursor, lost = bus_read(seen, key=key)
+        if lost:
+            print(f"WARNING: {lost} message(s) in {label} were trimmed "
+                  f"off the bus before this watch read them (raise "
+                  f"MUSE_RELAY_KEEP or watch more often)", file=sys.stderr)
         try:
             presence_beat(key)
         except Exception as e:
@@ -91,11 +99,10 @@ def watch_once(targets, announce_only=False):
                 shown += 1
                 if st is not None:
                     edits.record_incoming(st, m, NICK)  # ids for FWD/SAVE
-        seen += len(msgs)
-        t[3] = seen
-        write_seen(seen_file, seen)
+        t[3] = cursor
+        write_seen(seen_file, cursor)
         try:
-            mark_seen(key, NICK, seen)  # read receipt; never breaks watch
+            mark_seen(key, NICK, cursor)  # read receipt; never breaks watch
         except Exception as e:
             print(f"WARNING: read-receipt write failed ({e})",
                   file=sys.stderr)

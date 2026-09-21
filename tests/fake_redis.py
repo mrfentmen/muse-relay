@@ -137,6 +137,8 @@ class FakeUpstash:
             for v in a[1:]:
                 lst.insert(0, v)
             return len(lst)
+        if cmd == "llen":
+            return len(self.lists.get(a[0], []))
         if cmd == "ltrim":
             lst = self.lists.get(a[0], [])
             start, stop = int(a[1]), int(a[2])
@@ -216,4 +218,7 @@ class FakeUpstash:
         key = key or "muse-bus"
         self.lists.setdefault(key, []).append(body)
         self.pushes.append((key, body))
+        # Mirrors relay_common.bus_push: every RPUSH bumps a monotonic
+        # counter that LTRIM never touches (see relay_common.bus_read).
+        self._run("incr", [key + ":total"])
         return json.dumps({"result": len(self.lists[key])})

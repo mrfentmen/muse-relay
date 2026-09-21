@@ -29,7 +29,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from relay_common import (  # noqa: E402
-    bus_get, bus_key, clean_room, seen_path)
+    bus_key, bus_read, clean_room, seen_path)
 
 MAX_ATTEMPTS = 5
 BACKOFFS = (1, 2, 4, 8)  # seconds between the 5 attempts
@@ -111,11 +111,19 @@ def bridge_once(url, room, opener=None, sleep=time.sleep):
     seen_file = webhook_seen_path(room)
     seen = read_offset(seen_file)
     try:
-        msgs = bus_get(seen, -1, key=key)
+        msgs, _, lost = bus_read(seen, key=key)
     except Exception as e:
         print(f"RELAY_ERROR: bus read failed ({e})", file=sys.stderr)
         return 0, 1
     label = room if room else "main"
+    if lost:
+        print(f"WARNING: {lost} message(s) in '{label}' were trimmed off "
+              f"the bus before this bridge read them — they will never be "
+              f"delivered", file=sys.stderr)
+    # `lost` messages are gone, so the first message below sits at
+    # absolute index seen + lost. Advancing from there keeps the
+    # stop-and-retry semantics intact.
+    seen += lost
     posted = 0
     for m in msgs:
         seen += 1

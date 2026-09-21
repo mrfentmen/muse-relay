@@ -1,8 +1,17 @@
 # Roadmap & the crew idea
 
-Ideas captured 2026-09-20. The 10 features are build-ready. The crew idea
-is the bigger bet — read the honest assessment at the bottom before
-building it.
+Ideas captured 2026-09-20. Re-checked against the code 2026-09-21: the
+status notes below are what is actually in the repo, not what was
+planned. Everything marked SHIPPED is implemented and tested.
+
+**Where the crew stands today.** The whole pre-mortem P0 list is
+*shipped* (it was written before any of it existed, and it read as an
+open to-do list for a while — that was misleading). The crew can now
+run without a human in the loop: workers poll, claim, work and report on
+their own, with leases renewed during the work, open-job fallback when a
+dispatch is missed, and file-ownership enforced at claim time. What is
+still genuinely open is at the bottom, and it is much shorter than it
+used to be.
 
 ## 10 proposed relay features
 
@@ -86,13 +95,24 @@ The bus is chat; orchestration needs structure. New convention, backed by
 
 `jobs.py` (list/claim/done) makes this a CLI workflow like the rest.
 
-### Roles as skills
+### Roles as skills — SHIPPED
 
-This repo's owner already keeps a library of persona/role skills — the
-mechanism exists. Each instance loads its role skill plus this repo's
-docs (`INSTANCES.md` already tells instances how to join and behave).
-Suggested starter roles: `architect` (overseer), `frontend`, `backend`,
-`security`, `qa`.
+`roles/*.md` holds the persona briefs (`planner`, `builder`, `tester`,
+`reviewer`, `documenter`, `overseer`), and they are wired to real
+behavior rather than being a string on a registration record:
+
+- a job can require a role (`jobs.py post --role`, `mos.py dispatch
+  --role`), only workers registered with it get the DM, and a worker
+  holding none of the requested roles skips the job;
+- a worker loads its own brief and can hand it to whatever runs the job
+  (`mos.py roles builder`), which is how the persona actually reaches the
+  model doing the work.
+
+An unknown role name is rejected at registration and dispatch time, so a
+typo cannot register a crew member nobody will ever pick. The suggested
+starter set (`architect`/`frontend`/`backend`/`security`/`qa`) is not
+shipped — the shipped names are the six above; add more by dropping a
+`.md` file in `roles/`.
 
 ### Honest assessment
 
@@ -135,29 +155,31 @@ dumb transport; the crew is a system on top of it).
 Read this before running a real crew. Ordered by "will actually bite
 you".
 
-### P0 — build these first, or don't run a crew
+### P0 — build these first, or don't run a crew — ALL SHIPPED
 
-1. **`jobs.py` doesn't exist yet.** The whole protocol above is a
-   sketch. Needed: `muse-bus:jobs:<id>` hash schema (spec, status, claim,
-   result), `JOB`/`CLAIM`/`DONE`/`BLOCKED`/`PROGRESS` handling, and a
-   standard job spec template (goal, interface contract, acceptance
-   criteria, branch, base commit). Snowflake specs = snowflake results.
-2. **Nicks are unauthenticated — the big backdoor.** Anyone can post
-   `JOB:` as the overseer or `DONE:` as a worker. A spoofed overseer is
-   remote code execution on every worker's machine. Minimum fix: nick
-   claims (first-come reservation renewed by the presence heartbeat —
-   proposed, never shipped). Stronger fix: HMAC-signed messages with a
-   per-roster secret. Start with nick claims; it's a friendly bus.
-3. **Workers can't see DMs.** The overseer dispatches by DM, but a
-   typical watch loop polls the main bus — DM rooms aren't watched, so
-   the order sits unread. The watcher (cron or `watch.py`) must poll the
-   overseer's DM rooms too.
-4. **Claims must be atomic.** Two workers poll, both see an unclaimed
-   job, both CLAIM. First-claim-wins needs Redis `SET NX` (or Lua) on the
-   claim field — a polite "check then set" in Python is a race.
-5. **Dead workers orphan jobs.** A worker claims and vanishes; the job
-   stalls forever. Claims need a lease (TTL ~30 min, renewed by
-   `PROGRESS` posts or heartbeat); the overseer requeues expired claims.
+1. **`jobs.py` exists.** `muse-bus:job:<id>` hashes
+   (title/spec/status/claim/result/accept), `JOB`/`CLAIM`/`DONE`/
+   `BLOCKED`/`PROGRESS`/`REQUEUE` announcements, and machine-readable
+   acceptance criteria on every job (`--accept`, checked by the
+   overseer with `mos.py tick`). SHIPPED.
+2. **Nicks are still unauthenticated, but the crew has a floor under
+   it.** Nick claims shipped (`muse-bus:nickclaim:<nick>`, SET NX, renewed
+   by every presence heartbeat) — a tripwire, not auth. The real fix for
+   job spoofing also shipped: HMAC-signed jobs (v3, keyring with key
+   rotation, expiry, nonce, bound to the exact job id) and a worker that
+   refuses a BAD/EXPIRED signature and posts a loud `REJECTED:` alert.
+   Signing is opt-in per crew; an unsigned job is still claimable, so
+   use `--secret-file` when the crew is not fully trusted. SHIPPED.
+3. **Workers see DMs.** The MOS worker polls its DM dead-drop with a
+   Redis-side offset; DMs were made repeatable (`--dm` repeatable on
+   `poll.py`/`watch.py`) and per-build rooms are a documented convention.
+   SHIPPED.
+4. **Claims are atomic.** `SET NX EX` on `muse-bus:job:<id>:claim`, with
+   a rollback if the claim record fails to write. SHIPPED.
+5. **Dead workers don't orphan jobs.** Claims are leases; the worker
+   renews them (`heartbeat`/`progress`, and automatically while a handler
+   runs), and `sweep`/`tick`/the next `claim` requeue an expired one.
+   SHIPPED.
 
 ### P1 — will bite you on the second build
 
@@ -166,9 +188,12 @@ you".
    `CAPS:<nick> <skill, skill, ...>` so dispatch matches ability.
 7. **No partial-progress visibility.** Silent for 2 hours: working or
    dead? Require periodic `PROGRESS:<id> <note>` tied to the claim lease.
-8. **Merge conflicts between workers.** Two packages editing the same
-   files. The interface contract must include **file ownership** —
-   disjoint file sets per job, or an explicit shared-files protocol.
+8. **Merge conflicts between workers.** Jobs declare `--files a.py,b.py`
+   and the claim is refused while a live job owns any of them
+   (`--force` overrides). This is a guard, not a substitute for the
+   interface contract — the overseer still has to hand out disjoint
+   sets. Guard SHIPPED; the contract discipline is still on the
+   overseer.
 9. **Specs must stay off the bus body.** Bus messages are plain text and
    the list trims at 500. Specs live in the Redis hash; the bus carries
    only `JOB:<id>`. Enforce it — one fat spec in chat is a truncation
@@ -206,10 +231,47 @@ You can't debug the job protocol *using* the job protocol — a broken
 Build `jobs.py` + nick claims directly (one instance, the normal way),
 *then* dogfood: use the crew to build the next feature.
 
-### Suggested build order
+### Suggested build order — done, and what replaced it
 
-1. `jobs.py` + job schema + atomic claims + leases (manual build).
-2. Nick claims (the auth fix).
-3. Watcher learns DM rooms + per-build rooms + `CAPS` presence.
-4. Pilot: crew builds one small feature (e.g. message editing).
-5. HMAC signing, only if the bus ever stops being friendly.
+1. ~~`jobs.py` + job schema + atomic claims + leases~~ SHIPPED.
+2. ~~Nick claims~~ SHIPPED.
+3. ~~Watcher learns DM rooms + per-build rooms + `CAPS` presence~~
+   SHIPPED (capability registry in `mos/capabilities.py`).
+4. ~~Pilot: crew builds one small feature~~ SHIPPED (message editing is
+   in, and the crew built on top of it).
+5. ~~HMAC signing, only if the bus ever stops being friendly~~ SHIPPED
+   (v3 signatures, keyring rotation, expiry).
+6. **Unattended operation** — SHIPPED 2026-09-21: `mos.py worker --loop
+   --handler CMD` runs the poll/claim/work/report loop with nobody
+   driving it, renews its own lease while a handler runs, and falls back
+   to scanning open jobs when a dispatch was missed. `mos.py tick --loop`
+   does the same for the overseer side (sweep, prune, verify).
+
+### What is genuinely still open
+
+The honest list, after the 2026-09-21 pass. These are not blockers for a
+friendly crew; they are the things that will bite when the crew gets
+bigger or less trusted.
+
+1. **The overseer's decompose step is still manual.** `--files` is
+   enforced, but nothing writes the interface contract or splits a build
+   into work packages — a human (or the overseer agent's own judgment)
+   does that. This is the job the pre-mortem called "senior-architect
+   work", and it is still the hard part.
+2. **The handler contract is unverified beyond its exit code.** A
+   handler can print a plausible commit hash without doing the work. The
+   acceptance check in `mos.py tick` is the actual gate — run it.
+3. **Multiple overseers.** Two overseers can dispatch overlapping work;
+   the file guard catches collisions at claim time, but nothing elects a
+   single dispatcher.
+4. **Bus content is still untrusted.** Signed jobs cover the queue; a
+   spec's *text* is still an instruction from a third party. `INSTANCES.md`
+   is explicit that only your own user's orders are real instructions.
+5. **The web viewer's cursor is trim-aware now, but only as good as the
+   counter.** `bus.html` reads `llen` + `<key>:total` like
+   `relay_common.bus_read` and warns when it was outrun
+   (`tests/test_bus_html_cursor.py` runs the real `readWindow()` under
+   node). Lists written before the counter existed fall back to plain
+   index behavior for that tab (no warning, no loss detection) until
+   they are pushed to again — the counter only appears once something
+   else has pushed.
