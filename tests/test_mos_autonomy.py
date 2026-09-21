@@ -472,5 +472,86 @@ class VerifyWorktreeRecoveryTest(RelayTestCase):
         self.assertEqual(os.listdir(self.base), [])
 
 
+class WorkerBudgetTest(RelayTestCase):
+    """max_jobs binds locally, not only at dispatch.
+
+    Without a local budget a worker claims every job it matches in one
+    cycle and then works them one at a time, leaving the rest claimed,
+    untouched, and looking "in progress" to the whole crew while their
+    leases tick down towards a sweep.
+    """
+
+    def setUp(self):
+        super().setUp()
+        capabilities.CAPNS = "muse-bus:tcap"
+
+    def _post(self, title):
+        rc_, out, err = self.run_cli(
+            jobs.main, ["post", "--title", title, "--spec", "do it",
+                        "--req", "python"])
+        self.assertEqual(rc_, 0, err)
+        return out.split()[-1]
+
+    def _worker(self, max_jobs=1, nick="w1"):
+        self.set_nick(nick, "host-" + nick)
+        return worker.Worker(caps=["python"], dm_secret="s",
+                             workdir=self.tmp, max_jobs=max_jobs,
+                             scan_open=True)
+
+    def test_only_the_budget_is_claimed_in_a_cycle(self):
+        first = self._post("A")
+        second = self._post("B")
+        rep = self._worker().run_once(_ok_handler)
+        self.assertEqual(rep["claimed"], [first])
+        self.assertEqual(rep["deferred"], [second])
+        h, _ = jobs.job_get(second)
+        self.assertEqual(h["status"], "open")     # left for the crew
+        self.assertEqual(jobs.attempts_of(h), 0)   # and not an attempt
+
+    def test_a_wider_budget_takes_both(self):
+        first = self._post("A")
+        second = self._post("B")
+        rep = self._worker(max_jobs=2).run_once(_ok_handler)
+        self.assertEqual(rep["claimed"], [first, second])
+        self.assertEqual(rep["done"], [first, second])
+        self.assertEqual(rep["deferred"], [])
+
+    def test_a_claim_already_held_uses_up_the_budget(self):
+        first = self._post("A")
+        second = self._post("B")
+        w = self._worker()
+        self.assertTrue(w._claim(first)[0])
+        rep = w.run_once(_ok_handler)
+        self.assertEqual(rep["claimed"], [])
+        self.assertEqual(rep["deferred"], [second])
+
+    def test_the_next_cycle_picks_up_what_was_deferred(self):
+        self._post("A")
+        second = self._post("B")
+        w = self._worker()
+        w.run_once(_ok_handler)
+        self.assertEqual(w.run_once(_ok_handler)["claimed"], [second])
+
+    def test_the_cycle_line_reports_deferrals(self):
+        self._post("A")
+        self._post("B")
+        out = io.StringIO()
+        self._worker().run_loop(_ok_handler, interval=0, max_cycles=1,
+                                out=out)
+        self.assertIn("deferred=1", out.getvalue())
+
+    def test_the_cli_passes_max_jobs_through(self):
+        script = os.path.join(self.tmp, "handler.sh")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\necho COMMIT deadbee\n")
+        os.chmod(script, 0o755)
+        rc_, out, err = self.run_cli(
+            cli.main, ["worker", "--caps", "python", "--dm", "s",
+                       "--workdir", self.tmp, "--loop", "--handler", script,
+                       "--max-jobs", "3", "--interval", "0",
+                       "--max-cycles", "1"])
+        self.assertEqual(rc_, 0, err)
+
+
 if __name__ == "__main__":
     unittest.main()

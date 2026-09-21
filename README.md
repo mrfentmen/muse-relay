@@ -64,6 +64,9 @@ No dependencies beyond Python 3 and `curl`.
    | `MUSE_RELAY_JOBNS` | `muse-bus:job` | Redis key prefix for the job queue |
    | `MUSE_RELAY_CAPNS` | `muse-bus:cap` | Redis key prefix for the capability registry |
    | `MUSE_RELAY_CAP_STALE` | `900` | Seconds before a registered agent counts as stale and is pruned |
+   | `MUSE_RELAY_MAX_ATTEMPTS` | `3` | Claims a job gets before it is dead-lettered (`jobs.py post --max-attempts`) |
+   | `MUSE_RELAY_STUCK_AFTER` | `1800` | Seconds an open, claimable job may sit before `mos.py tick` alerts on it |
+   | `MUSE_RELAY_STUCK_ALERT_EVERY` | `3600` | Shortest gap between repeat stuck alerts for the same job |
    | `MUSE_RELAY_KEY_PREFIX` | `muse-bus` | Prefix for the admin keys (`admin`, `names`) |
    | `MUSE_RELAY_ADMIN_SECRET_FILE` | *(none)* | Default `--secret-file` for `admin.py` |
 
@@ -318,7 +321,8 @@ Make /login return 200 for valid creds and 401 otherwise.
 EOF
 python3 jobs.py post --title "Fix login" --spec "make it work" \
     --accept "tests pass" --req python --files src/login.py
-python3 jobs.py list                          # --status open|claimed|done|blocked|all
+python3 jobs.py post --title "Build B" --spec - --depends-on 3  # waits for job 3
+python3 jobs.py list                          # --status open|claimed|done|blocked|dead|all
 python3 jobs.py show 1                        # fields + full spec
 python3 jobs.py claim 1                       # atomic: first SET NX wins, 30-min lease
 python3 jobs.py heartbeat 1                   # renew the lease while working
@@ -326,6 +330,7 @@ python3 jobs.py progress 1 --note "half done" # notes progress, renews the lease
 python3 jobs.py done 1 --commit abc1234       # finish, with the result commit
 python3 jobs.py blocked 1 --reason "need API keys"   # release + flag it
 python3 jobs.py requeue 1                     # overseer: reopen a dead claim
+python3 jobs.py reset 1                       # human: reopen a dead-lettered job
 python3 jobs.py sweep                         # requeue every expired claim
 python3 jobs.py verify 1 --secret-file ~/.config/muse-relay/job-secret
 ```
@@ -335,8 +340,30 @@ python3 jobs.py verify 1 --secret-file ~/.config/muse-relay/job-secret
 worker renews with `heartbeat`/`progress`. If a worker dies, the lease
 expires and the next `claim`, `requeue`, or `sweep` reopens the job — no
 stuck work. The matching wire messages (`JOB:1 …`, `CLAIM:1 by nick`,
-`PROGRESS:1 …`, `DONE:1 <hash>`, `BLOCKED:1 …`, `REQUEUE:1`) are
-best-effort chat announcements; the Redis state is what counts.
+`PROGRESS:1 …`, `DONE:1 <hash>`, `BLOCKED:1 …`, `REQUEUE:1`, `DEAD:1 …`)
+are best-effort chat announcements; the Redis state is what counts.
+
+**Attempts and dead-lettering.** Every claim is an *attempt*. A job that
+fails acceptance, or whose worker disappears, goes back to `open` while
+it has attempts left; once it has used them all (`--max-attempts`, or
+`MUSE_RELAY_MAX_ATTEMPTS`, default 3) it becomes `dead` with the reason
+recorded in `dead_reason`. Nothing reopens a dead job automatically —
+one spec nobody can satisfy must not keep the whole crew busy forever.
+After fixing the spec, a human reopens it deliberately with
+`jobs.py reset <id>`, which clears the counter.
+
+**Dependencies.** `--depends-on 3,4` means the job is not claimable
+until every job it names is `done`, so one package is never built on
+another that does not exist yet. A dependency that is blocked or
+dead-lettered can never become done, so claiming reports it as the
+reason instead of waiting in silence.
+
+**Secret tripwire.** A spec is stored in plaintext and the title is
+announced on the bus, so `post` refuses a spec that looks like it
+contains a live credential (PEM key, `sk-…`, `ghp_…`, `AKIA…`, `xox…`,
+JWT, or a `password = …` assignment). It names the line and the kind of
+match, never the secret. Pass `--allow-secrets` when the match is a
+fixture or an example.
 
 **Worker git workflow:** pull `main` → cut a `feature/<job>` branch →
 commit there → push the branch → the overseer reviews and merges.
@@ -760,9 +787,17 @@ python3 mos.py worker --dm SECRET --caps python --roles builder \
     --loop --handler './run-agent.sh'
 
 # Overseer: periodic pass — sweep expired leases, prune stale agents,
-# verify done jobs against their acceptance criteria
+# verify done jobs against their acceptance criteria, alert on jobs
+# nobody is coming for
 python3 mos.py tick --repo /path/to/checkout --workdir-base /tmp/mos-verify
 python3 mos.py tick --loop --interval 60 --repo ... --workdir-base ...
+
+# See the crew: who is online, their load, and the queue by state
+python3 mos.py status
+python3 mos.py status --json
+
+# Preflight before blaming the crew: config, token, bus, roles, git
+python3 mos.py doctor --repo /path/to/checkout --secret-file ~/.config/muse-relay/job-secret
 
 # Restart recovery (idempotent — safe at every startup and on a schedule)
 python3 mos.py reconcile
@@ -814,6 +849,11 @@ beats at a third of the lease in the background.
 if one is lost, trimmed, or a worker joins the crew late, the scan finds
 open jobs matching its caps and role. Claiming is still atomic
 (`SET NX`), so a scan can never steal a live claim.
+- **The worker keeps a claim budget** (`--max-jobs`, default 1). It never
+holds more jobs than it can work on, so a job it cannot reach right now
+stays `open` for the rest of the crew instead of sitting claimed and
+untouched with its lease ticking down. Jobs run one at a time, so
+`--max-jobs 3` bounds how many a worker takes per cycle.
 - **A failed cycle is retried, not fatal.** A bus blip mid-loop is
 reported and the worker keeps going.
 
@@ -845,16 +885,37 @@ file-exists: mos/overseer.py
 tests-pass: tests.test_mos_flow
 command-ok: python3 -m py_compile mos/worker.py
 contains: mos/worker.py :: def run_once
+files-only: mos/worker.py,tests/test_mos_autonomy.py
 ```
 
-A done job whose checks fail is requeued to `open` with the failure
-report as its note — `done` without passing acceptance doesn't count.
+A done job whose checks fail goes back to `open` — or to `dead` once its
+attempts are gone — with the failure report as its note. `done` without
+passing acceptance doesn't count.
 
-**Signed jobs.** A signed job's HMAC is v3 and covers its whole semantic
-content — title, spec, acceptance, branch, base, room, **and the
-`--req`/`--files`/`--role` ownership declaration** — bound to the exact
-job id, kid, expiry and nonce. v2 and v1 signatures from before the
-upgrade still verify. See `jobs.py post --secret-file/--kid/--expires`.
+`files-only` is the other half of the file-ownership contract: `--files`
+stops two jobs claiming the same file, and `files-only` fails the job
+when its branch diff touches anything outside the declared set (glob
+patterns like `mos/*.py` are honoured). It measures `<base>...HEAD`, so
+it needs a base commit — the job's `--base`, or a local main/master to
+merge-base against — and it **fails with that reason** rather than
+passing when it cannot find one. `mos.py dispatch` adds it
+automatically when a dispatch names both `--files` and `--base`.
+
+**Signed jobs.** A signed job's HMAC is v4 and covers its whole semantic
+content — title, spec, acceptance, branch, base, room, **the
+`--req`/`--files`/`--role` ownership declaration, and the
+`--depends-on`/`--max-attempts` flow controls** — bound to the exact job
+id, kid, expiry and nonce. The attempt counter is deliberately not
+signed: it moves on every claim. v3, v2 and v1 signatures from before
+the upgrade still verify. See `jobs.py post --secret-file/--kid/--expires`.
+
+**Stuck alerts.** `mos.py tick` announces any open, claimable job that
+has sat for `MUSE_RELAY_STUCK_AFTER` (default 30 min) — whether that is
+because no capable worker is registered or because nobody claimed it —
+and re-alerts at most once per `MUSE_RELAY_STUCK_ALERT_EVERY` (default
+1 h). Jobs waiting on a dependency are skipped: the job they wait on is
+what should alarm, not every job queued behind it. Silence is the
+failure mode that looks most like progress, so the overseer breaks it.
 
 Capability records live in Redis (`muse-bus:cap:<nick>`) with a
 15-minute heartbeat (`MUSE_RELAY_CAP_STALE`); stale agents are pruned and
@@ -880,9 +941,11 @@ the `JOB:`/`CLAIM:`/`DONE:` announcements.
 python3 jobs.py post --title "Build X" --spec "detailed spec..." --accept "done when..."
 echo "long spec..." | python3 jobs.py post --title "Build Y"
 
-# Declare what the job needs and what files it owns
+# Declare what the job needs, what files it owns, what it waits for
 python3 jobs.py post --title "Build X" --spec "..." \
     --req python,testing --role builder --files src/api.py,src/api_test.py
+python3 jobs.py post --title "Package B" --spec "..." \
+    --depends-on 3 --max-attempts 5
 
 # See what's open, inspect one
 python3 jobs.py list
@@ -903,18 +966,26 @@ python3 jobs.py blocked 3 --reason "waiting on API key"
 # Overseer: requeue a stuck job, sweep expired leases
 python3 jobs.py requeue 3
 python3 jobs.py sweep
+
+# Out of attempts (dead-lettered)? Fix the spec, then give it a budget back
+python3 jobs.py list --status dead
+python3 jobs.py reset 4
 ```
 
 `--req` and `--role` are persisted on the job, so a worker that never saw
 the dispatch DM can still tell whether an open job is its own. `--files`
 is enforced at claim time (see File ownership above): a claim on files a
-live job already owns is refused unless you pass `--force`.
+live job already owns is refused unless you pass `--force`. `--depends-on`
+is enforced too: an unready job cannot be claimed, and its declared cost
+is honest — the blocked claim consumes no attempt.
 
 Job status protocol: `open` → `claimed` → `done`. A blocked job goes
 `blocked` → `open` via `requeue`. If a claim lease expires, `sweep`
-requeues it automatically. Bus announcements: `JOB:` (posted),
-`CLAIM:` (claimed), `PROGRESS:` (note), `DONE:` (finished),
-`BLOCKED:` (stuck), `REQUEUE:` (back to open).
+requeues it automatically — unless it is out of attempts, in which case
+sweep dead-letters it (`dead`, with `dead_reason` recorded). Bus
+announcements: `JOB:` (posted), `CLAIM:` (claimed), `PROGRESS:` (note),
+`DONE:` (finished), `BLOCKED:` (stuck), `REQUEUE:` (back to open),
+`DEAD:` (out of attempts), `RESET:` (reopened by hand).
 
 Worker git workflow: pull main → create `feature/<job>` branch → commit
 → push the branch → overseer reviews → merge. Never push straight to

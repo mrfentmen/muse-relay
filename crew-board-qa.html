@@ -32,7 +32,7 @@
   #status { color: #8b949e; font-size: 12px; }
   #status.err { color: #f85149; }
   #board {
-    display: grid; grid-template-columns: repeat(4, minmax(240px, 1fr));
+    display: grid; grid-template-columns: repeat(5, minmax(240px, 1fr));
     gap: 12px; padding: 12px; align-items: start;
   }
   @media (max-width: 900px) {
@@ -167,6 +167,7 @@
   <div class="col" id="col-open"><h2>open <span class="n">0</span></h2></div>
   <div class="col" id="col-claimed"><h2>claimed <span class="n">0</span></h2></div>
   <div class="col" id="col-blocked"><h2>blocked <span class="n">0</span></h2></div>
+  <div class="col" id="col-dead"><h2>dead <span class="n">0</span></h2></div>
   <div class="col" id="col-done"><h2>done <span class="n">0</span></h2></div>
 </div>
 <aside id="detail" hidden aria-label="job detail"></aside>
@@ -460,7 +461,7 @@ function cardHTML(jid, h) {
 
 function render() {
   const q = $("q").value.trim();
-  const cols = { open: [], claimed: [], blocked: [], done: [] };
+  const cols = { open: [], claimed: [], blocked: [], dead: [], done: [] };
   let shown = 0;
   for (const { jid, h } of JOBS) {
     if (!matches(h, jid, q)) continue;

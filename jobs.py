@@ -10,7 +10,9 @@ Usage:
   jobs.py post --title T --spec S|--spec - [--accept A] [--branch B]
                [--base C] [--room R] [--lease SECS]
                [--req python,testing] [--files a.py,b.py]
-  jobs.py list [--status open|claimed|done|blocked|all]
+               [--role builder] [--depends-on 3,4] [--max-attempts N]
+               [--allow-secrets]
+  jobs.py list [--status open|claimed|done|blocked|dead|all]
   jobs.py show <id>
   jobs.py claim <id> [--room R] [--lease SECS] [--force]
 
@@ -20,11 +22,30 @@ Usage:
   workers editing one file can only end in a merge nobody asked for.
   --req is what lets a worker that missed the DM (or joined late) still
   tell whether an open job is its own (see mos/worker.py scan_open).
+
+  --depends-on makes a job wait: it cannot be claimed until every job it
+  names is done, so one package is never built on another that does not
+  exist yet. A dependency that is blocked or dead-lettered is reported
+  as the reason instead of being waited on forever.
+
+  --max-attempts bounds the retry loop. Every claim is an attempt, and a
+  job that fails acceptance (or loses its worker) is handed back for
+  another one; once it has used its attempts it is dead-lettered instead
+  of being reopened forever — one bad spec must not keep the whole crew
+  turning the crank. `jobs.py reset <id>` reopens it deliberately with a
+  fresh budget, which is what a human does after fixing the spec.
+
+  A spec is stored in plaintext and announced on the bus, so post
+  refuses one that looks like it contains a live credential (see
+  scan_for_secrets). --allow-secrets overrides that when it is a false
+  positive.
+
   jobs.py heartbeat <id> [--lease SECS]
   jobs.py progress <id> --note TEXT [--room R]
   jobs.py done <id> --commit HASH [--note TEXT] [--room R]
   jobs.py blocked <id> --reason TEXT [--room R]
   jobs.py requeue <id> [--room R]
+  jobs.py reset <id> [--room R]
   jobs.py sweep [--room R]
   jobs.py verify <id> --secret-file PATH
 
@@ -59,8 +80,12 @@ Claiming is atomic via SET NX: exactly one worker wins the race. The
 mutex carries a TTL (default 30 min); the worker renews it with
 heartbeat/progress. If the mutex expires while the job is still
 "claimed", any claim (or requeue/sweep) treats the job as abandoned and
-reopens it. Wire messages (JOB:, CLAIM:, ...) are best-effort chat
-announcements; the Redis state is the source of truth.
+reopens it — unless the job is out of attempts, in which case it is
+dead-lettered (status "dead") instead of being retried again.
+
+A job is one of: open, claimed, done, blocked, dead. Wire messages
+(JOB:, CLAIM:, ...) are best-effort chat announcements; the Redis state
+is the source of truth.
 
 Never prints the token.
 """
@@ -69,6 +94,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -81,6 +107,9 @@ from relay_common import (  # noqa: E402
 
 NS = os.environ.get("MUSE_RELAY_JOBNS", "muse-bus:job")
 LEASE_DEFAULT = 1800  # 30 minutes
+# Claims a job gets before it is dead-lettered (override with
+# MUSE_RELAY_MAX_ATTEMPTS or --max-attempts at post time).
+MAX_ATTEMPTS_DEFAULT = int(os.environ.get("MUSE_RELAY_MAX_ATTEMPTS", "3"))
 
 
 def _q(s):
@@ -172,6 +201,60 @@ def roles_of(h):
     return {r.strip().lower() for r in (h.get("role") or "").split(",") if r.strip()}
 
 
+def attempts_of(h):
+    """How many times this job has been claimed (0 when never claimed)."""
+    try:
+        return int(h.get("attempts") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def max_attempts_of(h):
+    """How many claims a job gets before it is dead-lettered.
+
+    Read from the record (written at post time) rather than from the
+    environment, so a worker and the overseer with different settings
+    still agree on when a job is out of attempts.
+    """
+    try:
+        return max(1, int(h.get("max_attempts") or MAX_ATTEMPTS_DEFAULT))
+    except (TypeError, ValueError):
+        return MAX_ATTEMPTS_DEFAULT
+
+
+def exhausted(h):
+    """True when a job has used up its attempts."""
+    return attempts_of(h) >= max_attempts_of(h)
+
+
+def deps_of(h):
+    """Job ids this job waits for, in declared order ([] when none)."""
+    return [d.strip() for d in (h.get("deps") or "").split(",") if d.strip()]
+
+
+def deps_ready(jid, h):
+    """(ready, reason) — whether every job this one waits for is done.
+
+    A dependency counts as satisfied only when it is `done`. A
+    dependency that is blocked or dead-lettered will never become done
+    on its own, so it is reported as the reason instead of being waited
+    on in silence.
+    """
+    ids = deps_of(h)
+    if not ids:
+        return True, ""
+    for dep in ids:
+        dh, _ = job_get(dep)
+        if dh is None:
+            return False, f"dependency {dep} no longer exists"
+        status = dh.get("status", "?")
+        if status != "done":
+            why = dh.get("dead_reason") or dh.get("note") or ""
+            return False, (f"dependency {dep} is {status}"
+                           + (f": {why.strip()[:120]}" if why.strip() else ""))
+    return True, ""
+
+
 def _file_conflicts(jid, h):
     """Other LIVE jobs whose declared files overlap this job's.
 
@@ -203,6 +286,40 @@ def _file_conflicts(jid, h):
     return out
 
 
+_SECRET_PATTERNS = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PEM private key"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "OpenAI-style API key"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "GitHub token"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "Slack token"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key id"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"), "Google API key"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+                r"[A-Za-z0-9_-]{10,}\b"), "JWT"),
+    (re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token)\b"
+                r"\s*[:=]\s*[^\s'\"]{12,}"), "credential assignment"),
+)
+
+
+def scan_for_secrets(text):
+    """Label anything in text that looks like a live credential.
+
+    A job spec is stored in plaintext and its title is announced on the
+    bus, so a credential pasted into one is a credential handed to
+    everyone holding the bus token. This is a tripwire, not a proof —
+    it names the KIND of match and the line, and never echoes the
+    matched text, because printing the secret would undo the point.
+
+    Returns [(lineno, label)].
+    """
+    hits = []
+    for lineno, line in enumerate((text or "").splitlines(), 1):
+        for pattern, label in _SECRET_PATTERNS:
+            if pattern.search(line):
+                hits.append((lineno, label))
+                break
+    return hits
+
+
 # --- Signed jobs: HMAC-SHA256 over canonical job content -------------------
 #
 # Bus nicks are unauthenticated, so anyone can post JOB: as the overseer.
@@ -223,10 +340,11 @@ def _file_conflicts(jid, h):
 # Signature versions: v1 is the original payload (title/spec/accept/
 # branch/base/room, single secret). v2 binds the signature to the exact
 # job instance (jid, kid, created_at, expires_at, nonce) so a captured
-# signature cannot be transplanted onto another job. New posts are v2;
-# v1 signatures still verify for jobs posted before the upgrade.
+# signature cannot be transplanted onto another job. New posts are v4,
+# which adds req/files/role and deps/max_attempts; v1–v3 signatures
+# still verify for jobs posted before each upgrade.
 
-SIG_VERSION = "3"
+SIG_VERSION = "4"
 
 
 def _read_keyring(path):
@@ -303,14 +421,14 @@ def _sign_job_v1(secret, fields, spec):
                     hashlib.sha256).hexdigest()
 
 
-def _canonical_payload_v3(jid, kid, fields, spec):
-    """v3 payload: v2 plus the job's declared requirements and files.
+def _v3_payload(jid, kid, fields, spec):
+    """Payload shared by v3 and v4: v2 plus requirements and files.
 
     Those two fields decide who may take the job and which files are
     theirs, so a signature that ignored them would leave the ownership
     declaration editable. v2 signatures still verify (see verify_job).
     """
-    payload = {
+    return {
         "jid": str(jid),
         "kid": str(kid),
         "title": fields.get("title", ""),
@@ -326,6 +444,25 @@ def _canonical_payload_v3(jid, kid, fields, spec):
         "expires_at": str(fields.get("expires_at", "")),
         "nonce": str(fields.get("nonce", "")),
     }
+
+
+def _canonical_payload_v3(jid, kid, fields, spec):
+    return json.dumps(_v3_payload(jid, kid, fields, spec), sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _canonical_payload_v4(jid, kid, fields, spec):
+    """v4 payload: v3 plus the job's dependencies and attempt budget.
+
+    deps decide WHEN a job may be claimed and max_attempts decides
+    whether a failure reopens it or dead-letters it, so a signature
+    that ignored them would leave the queue's flow editable. `attempts`
+    is deliberately NOT signed: it moves on every claim, so a signature
+    over it could never be verified after the first one.
+    """
+    payload = _v3_payload(jid, kid, fields, spec)
+    payload["deps"] = ",".join(deps_of(fields))
+    payload["max_attempts"] = str(fields.get("max_attempts", ""))
     return json.dumps(payload, sort_keys=True,
                       separators=(",", ":")).encode("utf-8")
 
@@ -337,6 +474,11 @@ def _sign_job_v2(secret, jid, kid, fields, spec):
 
 def _sign_job_v3(secret, jid, kid, fields, spec):
     return hmac.new(secret, _canonical_payload_v3(jid, kid, fields, spec),
+                    hashlib.sha256).hexdigest()
+
+
+def _sign_job_v4(secret, jid, kid, fields, spec):
+    return hmac.new(secret, _canonical_payload_v4(jid, kid, fields, spec),
                     hashlib.sha256).hexdigest()
 
 
@@ -361,7 +503,7 @@ def verify_job(jid, keyring):
         good = hmac.compare_digest(
             _sign_job_v1(secret, h, spec or ""), sig)
         return "OK" if good else "BAD"
-    if version not in ("2", "3"):
+    if version not in ("2", "3", "4"):
         return "BAD"
     kid = h.get("sig_kid", "")
     secret = keyring.get(kid)
@@ -370,7 +512,8 @@ def verify_job(jid, keyring):
     exp = h.get("expires_at", "")
     if exp and int(time.time()) > int(exp):
         return "EXPIRED"
-    sign = _sign_job_v3 if version == "3" else _sign_job_v2
+    sign = {"2": _sign_job_v2, "3": _sign_job_v3,
+            "4": _sign_job_v4}[version]
     good = hmac.compare_digest(sign(secret, jid, kid, h, spec or ""), sig)
     return "OK" if good else "BAD"
 
@@ -420,23 +563,43 @@ def _mutex_holder(jid):
         return "?"
 
 
-def _requeue_fields(jid, h, room):
-    """Reset a claimed job to open (lease expired or overseer override)."""
-    _hdel(_job_key(jid), "claim", "claim_host", "claimed_at", "lease_until")
-    _hset(_job_key(jid), {"status": "open"})
+def settle_failed(jid, h, room, reason="lease expired"):
+    """Hand a failed or abandoned claim back, or dead-letter it.
+
+    Used by requeue, sweep and the overseer's acceptance failure: all
+    three mean "this attempt did not work". A job with attempts left is
+    reopened for another worker; a job with none is dead-lettered so a
+    spec nobody can satisfy stops consuming the crew every cycle and
+    becomes visible instead. Reopening a dead job is a deliberate human
+    act (`jobs.py reset <id>`).
+
+    Returns the job's new status: "open" or "dead".
+    """
+    _hdel(_job_key(jid), "claim", "claim_host", "claimed_at", "lease_until",
+          "result_commit", "verified", "verified_at", "verify_report")
     try:
         api_get(f"del/{_claim_key(jid)}")
     except Exception:
         pass
+    used = attempts_of(h)
+    if exhausted(h):
+        _hset(_job_key(jid), {
+            "status": "dead", "dead_at": int(time.time()),
+            "dead_reason": f"{reason} after {used} attempt(s)",
+        })
+        _announce(room, f"DEAD:{jid} {reason} (after {used} attempt(s))")
+        return "dead"
+    _hset(_job_key(jid), {"status": "open"})
     _announce(room, f"REQUEUE:{jid}")
+    return "open"
 
 
 def _claim_or_requeue(jid, h):
-    """If h is claimed but its mutex is gone, the lease expired: reopen.
+    """If h is claimed but its mutex is gone, the lease expired: settle it.
 
     Returns the (possibly refreshed) fields dict."""
     if h.get("status") == "claimed" and _mutex_holder(jid) is None:
-        _requeue_fields(jid, h, h.get("room") or "")
+        settle_failed(jid, h, h.get("room") or "")
         h, _ = job_get(jid)
     return h
 
@@ -462,6 +625,32 @@ def cmd_post(args):
                     for f in (args.files or "").split(",") if f.strip()})
     job_roles = sorted({r.strip().lower()
                         for r in (args.role or "").split(",") if r.strip()})
+    hits = scan_for_secrets(spec)
+    if hits and not args.allow_secrets:
+        for lineno, label in hits:
+            print(f"ERROR: spec line {lineno} looks like a {label}",
+                  file=sys.stderr)
+        print("ERROR: refusing to post — the spec is stored in plaintext "
+              "and the job title is announced on the bus. Hand the "
+              "credential over out of band, or re-post with "
+              "--allow-secrets if this is a false positive",
+              file=sys.stderr)
+        return 2
+    deps = [d.strip() for d in (args.depends_on or "").split(",") if d.strip()]
+    for dep in deps:
+        if not _valid_id(dep):
+            print(f"ERROR: --depends-on wants job ids, got {dep!r}",
+                  file=sys.stderr)
+            return 2
+        dh, _ = job_get(dep)
+        if dh is None:
+            print(f"ERROR: no such job to depend on: {dep}", file=sys.stderr)
+            return 2
+    deps = sorted(set(deps))
+    max_attempts = args.max_attempts
+    if max_attempts < 1:
+        print("ERROR: --max-attempts needs at least 1", file=sys.stderr)
+        return 2
     try:
         jid = str(json.loads(api_get(f"incr/{_seq_key()}"))["result"])
         now = int(time.time())
@@ -471,6 +660,7 @@ def cmd_post(args):
             "lease": lease, "created_by": NICK, "created_host": INSTANCE_ID,
             "created_at": now, "req": ",".join(reqs),
             "files": ",".join(files), "role": ",".join(job_roles),
+            "deps": ",".join(deps), "max_attempts": str(max_attempts),
         }
         _hset(_job_key(jid), fields)
         api_post(f"set/{_spec_key(jid)}", spec)
@@ -501,7 +691,7 @@ def cmd_post(args):
         sig_fields["expires_at"] = expires_at
         try:
             _hset(_job_key(jid), {
-                "sig": _sign_job_v3(secret, jid, kid, sig_fields, spec),
+                "sig": _sign_job_v4(secret, jid, kid, sig_fields, spec),
                 "sig_v": SIG_VERSION,
                 "sig_kid": kid,
                 "signed_by": NICK,
@@ -547,10 +737,12 @@ def cmd_show(args):
         print(f"ERROR: no such job: {args.id}", file=sys.stderr)
         return 2
     for f in ("title", "status", "room", "branch", "base", "accept",
-              "req", "files", "role", "claim", "claim_host", "claimed_at",
-              "lease_until", "result_commit", "note", "created_by",
-              "created_host", "created_at", "lease", "signed_by",
-              "sig_v", "sig_kid", "expires_at", "nonce"):
+              "req", "files", "role", "deps", "attempts", "max_attempts",
+              "dead_at", "dead_reason", "claim", "claim_host", "claimed_at",
+              "lease_until", "result_commit", "note", "verified",
+              "verified_at", "verify_report", "created_by", "created_host",
+              "created_at", "lease", "signed_by", "sig_v", "sig_kid",
+              "expires_at", "nonce"):
         if h.get(f):
             print(f"{f}: {h[f]}")
     w = _creator_warning(h)
@@ -602,10 +794,26 @@ def cmd_claim(args):
               f"verification", file=sys.stderr)
     h = _claim_or_requeue(args.id, h)
     if h.get("status") != "open":
-        print(f"ERROR: job {args.id} is {h.get('status')}"
-              + (f" (claimed by {h.get('claim')})"
-                 if h.get("status") == "claimed" else ""),
-              file=sys.stderr)
+        if h.get("status") == "dead":
+            print(f"ERROR: job {args.id} is dead-lettered "
+                  f"({h.get('dead_reason') or 'attempts exhausted'}) — "
+                  f"fix the spec, then `jobs.py reset {args.id}` to give "
+                  f"it a fresh budget", file=sys.stderr)
+        else:
+            print(f"ERROR: job {args.id} is {h.get('status')}"
+                  + (f" (claimed by {h.get('claim')})"
+                     if h.get("status") == "claimed" else ""),
+                  file=sys.stderr)
+        return 2
+    ready, why = deps_ready(args.id, h)
+    if not ready:
+        print(f"ERROR: job {args.id} is waiting on its dependencies: "
+              f"{why}", file=sys.stderr)
+        return 2
+    if exhausted(h):
+        print(f"ERROR: job {args.id} has used all {max_attempts_of(h)} "
+              f"attempt(s) and is exhausted — `jobs.py reset {args.id}` "
+              f"reopens it deliberately", file=sys.stderr)
         return 2
     # File-ownership guard: a job that declares files owns them while it
     # is live, so two workers never get dispatched onto the same file.
@@ -639,6 +847,9 @@ def cmd_claim(args):
         _hset(_job_key(args.id), {
             "status": "claimed", "claim": NICK, "claim_host": INSTANCE_ID,
             "claimed_at": now, "lease_until": now + lease, "lease": lease,
+            # Every claim is an attempt: the counter is what stops a job
+            # nobody can satisfy from being retried forever.
+            "attempts": attempts_of(h) + 1,
         })
     except Exception as e:
         # Roll back the mutex so the job stays open and claimable instead
@@ -786,11 +997,46 @@ def cmd_requeue(args):
               f"(held by '{h.get('claim')}')", file=sys.stderr)
         return 2
     try:
-        _requeue_fields(args.id, h, args.room or h.get("room") or "")
+        state = settle_failed(args.id, h,
+                              args.room or h.get("room") or "")
     except Exception as e:
         print(f"RELAY_ERROR: requeue failed ({e})", file=sys.stderr)
         return 2
+    if state == "dead":
+        print(f"DEAD_LETTERED {args.id} (attempts exhausted)")
+        return 0
     print(f"REQUEUED {args.id}")
+    return 0
+
+
+def cmd_reset(args):
+    """Reopen a dead-lettered (or exhausted) job with a fresh budget.
+
+    The deliberate human step the dead-letter rule hands to: after
+    fixing the spec, give the job its attempts back. Refused while a
+    live claim holds it, so a reset can never yank work in progress.
+    """
+    h, _ = job_get(args.id)
+    if h is None:
+        print(f"ERROR: no such job: {args.id}", file=sys.stderr)
+        return 2
+    if h.get("status") == "claimed" and _mutex_holder(args.id) is not None:
+        print(f"ERROR: job {args.id} is still claimed by "
+              f"'{h.get('claim')}' — requeue or wait for it to finish",
+              file=sys.stderr)
+        return 2
+    try:
+        _hset(_job_key(args.id), {"status": "open", "attempts": "0"})
+        _hdel(_job_key(args.id), "dead_at", "dead_reason", "claim",
+              "claim_host", "claimed_at", "lease_until", "result_commit",
+              "verified", "verified_at", "verify_report",
+              "stuck_alerted_at")
+        api_get(f"del/{_claim_key(args.id)}")
+    except Exception as e:
+        print(f"RELAY_ERROR: reset failed ({e})", file=sys.stderr)
+        return 2
+    _announce(args.room or h.get("room") or "", f"RESET:{args.id}")
+    print(f"RESET {args.id}")
     return 0
 
 
@@ -806,8 +1052,12 @@ def cmd_sweep(args):
         if h and h.get("status") == "claimed" and \
                 _mutex_holder(jid) is None:
             try:
-                _requeue_fields(jid, h, args.room or h.get("room") or "")
-                print(f"REQUEUED {jid}")
+                state = settle_failed(jid, h,
+                                      args.room or h.get("room") or "")
+                if state == "dead":
+                    print(f"DEAD_LETTERED {jid} (attempts exhausted)")
+                else:
+                    print(f"REQUEUED {jid}")
                 n += 1
             except Exception as e:
                 print(f"WARNING: requeue {jid} failed ({e})",
@@ -838,6 +1088,16 @@ def main(argv=None):
     p.add_argument("--role", default="",
                    help="role skills the worker should hold "
                         "(see roles/), comma-separated")
+    p.add_argument("--depends-on", default="",
+                   help="job ids this job waits for, comma-separated; it "
+                        "cannot be claimed until they are done")
+    p.add_argument("--max-attempts", type=int,
+                   default=MAX_ATTEMPTS_DEFAULT,
+                   help="claims allowed before the job is dead-lettered "
+                        f"(default: {MAX_ATTEMPTS_DEFAULT})")
+    p.add_argument("--allow-secrets", action="store_true",
+                   help="post even when the spec looks like it contains "
+                        "a credential")
     p.add_argument("--lease", type=int, default=LEASE_DEFAULT)
     p.add_argument("--secret-file", default="",
                    help="sign the job with this crew secret (HMAC-SHA256)")
@@ -849,7 +1109,8 @@ def main(argv=None):
 
     p = sub.add_parser("list", help="list jobs")
     p.add_argument("--status", default="all",
-                   choices=["all", "open", "claimed", "done", "blocked"])
+                   choices=["all", "open", "claimed", "done", "blocked",
+                            "dead"])
     p.set_defaults(fn=cmd_list)
 
     p = sub.add_parser("show", help="show a job and its spec")
@@ -897,6 +1158,12 @@ def main(argv=None):
     p.add_argument("id")
     p.add_argument("--room", default="", help="announce room override")
     p.set_defaults(fn=cmd_requeue)
+
+    p = sub.add_parser("reset",
+                       help="reopen a dead-lettered job with fresh attempts")
+    p.add_argument("id")
+    p.add_argument("--room", default="", help="announce room override")
+    p.set_defaults(fn=cmd_reset)
 
     p = sub.add_parser("sweep",
                        help="requeue all lease-expired claims")

@@ -32,7 +32,7 @@
   #status { color: #8b949e; font-size: 12px; }
   #status.err { color: #f85149; }
   #board {
-    display: grid; grid-template-columns: repeat(4, minmax(240px, 1fr));
+    display: grid; grid-template-columns: repeat(5, minmax(240px, 1fr));
     gap: 12px; padding: 12px; align-items: start;
   }
   @media (max-width: 900px) {
@@ -167,6 +167,7 @@
   <div class="col" id="col-open"><h2>open <span class="n">0</span></h2></div>
   <div class="col" id="col-claimed"><h2>claimed <span class="n">0</span></h2></div>
   <div class="col" id="col-blocked"><h2>blocked <span class="n">0</span></h2></div>
+  <div class="col" id="col-dead"><h2>dead <span class="n">0</span></h2></div>
   <div class="col" id="col-done"><h2>done <span class="n">0</span></h2></div>
 </div>
 <aside id="detail" hidden aria-label="job detail"></aside>
@@ -354,7 +355,13 @@ function pills(h) {
     : `<span class="pill unsigned">unsigned</span>`;
   const claim = h.claim ? `<span class="pill claim">${nickBtn(h.claim)}</span>` : "";
   const verified = h.verified ? `<span class="pill signed">verified</span>` : "";
-  return sig + claim + verified;
+  // attempts/max_attempts is what decides whether a failure reopens the
+  // job or dead-letters it, so the board shows the budget while it runs.
+  const tries = h.attempts
+    ? `<span class="pill" title="claims used of the budget">try ${esc(h.attempts)}${h.max_attempts ? "/" + esc(h.max_attempts) : ""}</span>`
+    : "";
+  const deps = h.deps ? `<span class="pill" title="waits for job ${esc(h.deps)}">deps ${esc(h.deps)}</span>` : "";
+  return sig + claim + verified + tries + deps;
 }
 
 function cardHTML(jid, h) {
@@ -373,7 +380,7 @@ function cardHTML(jid, h) {
 
 function render() {
   const q = $("q").value.trim();
-  const cols = { open: [], claimed: [], blocked: [], done: [] };
+  const cols = { open: [], claimed: [], blocked: [], dead: [], done: [] };
   let shown = 0;
   for (const { jid, h } of JOBS) {
     if (!matches(h, jid, q)) continue;
@@ -407,6 +414,7 @@ function historyRows(h) {
   ev("claimed", h.claimed_at);
   ev("lease until", h.lease_until);
   ev("done", h.done_at);
+  ev("dead-lettered", h.dead_at);
   if (h.verified_at) ev("verified", h.verified_at);
   if (h.expires_at) ev("spec expires", h.expires_at);
   return rows;
@@ -429,6 +437,9 @@ function detailHTML(jid, h, spec) {
     kv("created by", h.created_by ? nickBtn(h.created_by) + (h.created_host ? " @ " + esc(h.created_host) : "") : "") +
     kv("signed by", h.signed_by ? nickBtn(h.signed_by) : "") +
     kv("result", h.result_commit ? esc(h.result_commit) : "") +
+    kv("attempts", h.max_attempts ? `${esc(h.attempts || "0")} of ${esc(h.max_attempts)}` : "") +
+    kv("waits for", h.deps ? esc(h.deps) : "") +
+    kv("dead reason", h.dead_reason ? esc(h.dead_reason) : "") +
     hist +
     `</dl>` +
     (h.note ? `<h4>note</h4><pre>${esc(h.note)}</pre>` : "") +

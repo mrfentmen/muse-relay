@@ -13,8 +13,9 @@ it exists — scripts, Redis keys, and failure modes included.
 - **`jobs.py`** is the job queue. State lives in Redis hashes under the
   namespace `MUSE_RELAY_JOBNS` (default `muse-bus:job`):
   `<ns>:<id>` (fields: title, room, branch, base, accept, status,
-  claim, lease, and the ownership declaration `req`/`files`/`role`),
-  `<ns>:<id>:spec` (the full spec text — never sent
+  claim, lease, the ownership declaration `req`/`files`/`role`, the flow
+  controls `deps`/`max_attempts`/`attempts`, and `dead_reason` once it is
+  dead-lettered), `<ns>:<id>:spec` (the full spec text — never sent
   over the bus), `<ns>:<id>:claim` (the claim mutex), `<ns>seq`
   (id counter), `<ns>index` (zset of all ids).
 - **File ownership is enforced.** A job that declares `--files a.py` owns
@@ -22,9 +23,24 @@ it exists — scripts, Redis keys, and failure modes included.
   overlapping claim from another worker (`--force` overrides). This is
   the P1 "interface contract" item's enforcement half — the overseer
   still has to allocate disjoint file sets in the first place.
+- **Specs are scanned for credentials before they are stored.** A spec
+  is plaintext in Redis and the job title is announced on the bus, so
+  `jobs.py post` refuses one that looks like it holds a live credential
+  (PEM key, `sk-…`, `ghp_…`, `AKIA…`, `xox…`, JWT, `password = …`). It
+  reports the line and the kind of match, never the secret. `--allow-secrets`
+  is the override for fixtures. This is a tripwire, not a scanner: it
+  cannot prove a spec is clean, so still hand credentials over
+  out-of-band.
 - **The chat lines** (`JOB:`, `CLAIM:`, `DONE:`, ...) are best-effort
   announcements pushed by `jobs.py`. Redis is the source of truth;
   when a chat line and `jobs.py show` disagree, believe `jobs.py show`.
+- **Two commands answer "what is going on".** `mos.py status` is one
+  screen: every registered agent with caps/roles/load/freshness, the
+  queue counted by state, and the oldest open job with its age
+  (`--json` for a machine-readable snapshot). `mos.py doctor` is the
+  preflight — REST URL, token file, reachability, role names, git repo,
+  crew secret file — printing `OK`/`FAIL` per check and exiting non-zero
+  when something is wrong. Neither ever prints the token.
 
 ## Dispatch: overseer → worker DMs
 
@@ -80,9 +96,25 @@ everything. Never put secrets in a DM *or* a spec.
   `result_commit`, releases the mutex, and announces
   `DONE:7 abc1234`. `blocked` sets `status=blocked` + `note` and also
   releases the mutex.
+- **Every claim is an attempt, and a job has a budget.** A claim writes
+  `attempts+1`; `max_attempts` (post-time `--max-attempts`, or
+  `MUSE_RELAY_MAX_ATTEMPTS`, default 3) bounds it. A job that fails
+  acceptance, or whose worker disappears, goes back to `open` while it
+  has attempts left. Once they are gone, `requeue`/`sweep`/the next
+  `claim` dead-letter it: `status=dead`, `dead_reason` recorded, and
+  `DEAD:<id> …` announced. Nothing reopens it automatically — that is
+  the point: one unsatisfiable spec must not keep the whole crew busy
+  forever. After fixing the spec, `jobs.py reset <id>` reopens it with a
+  cleared counter (refused while a live claim holds it).
+- **A claim on an unready job costs nothing.** A job with `--depends-on`
+  is not claimable until every job it names is `done`; the refusal names
+  the dependency and its state, and consumes no attempt. A dependency
+  that is blocked or dead-lettered can never become done, so it is
+  reported as the reason instead of being awaited.
 - **The overseer's hygiene**: `jobs.py sweep` requeues every expired
-  claim; `jobs.py list --status open|claimed|done|blocked` is the
-  board; `jobs.py show <id>` prints the fields and the full spec.
+  claim (or dead-letters an exhausted one); `jobs.py list --status
+  open|claimed|done|blocked|dead` is the board; `jobs.py show <id>`
+  prints the fields and the full spec.
 - **Trust warning**: `claim`/`show` print a warning when the job
   poster's nick is now claimed by a *different instance* than the one
   that posted it — possible nick spoofing. Verify before working the
@@ -169,9 +201,12 @@ is never printed by any command.
 **Limitations:** signing proves the spec came from someone holding the
 secret — it says nothing about whether the spec is *wise*. Workers still
 read the spec before running it. A leaked secret means re-keying the
-whole crew. v1 and v2 signatures (pre-hardening) still verify; new posts
-are v3, which additionally covers `--req`, `--files` and `--role`, so the
-ownership declaration cannot be edited under a valid signature.
+whole crew. v1, v2 and v3 signatures (pre-hardening) still verify; new
+posts are v4, which additionally covers `--req`, `--files`, `--role`,
+`--depends-on` and `--max-attempts`, so neither the ownership declaration
+nor the job's flow controls can be edited under a valid signature. The
+attempt counter is deliberately *not* signed, because it moves on every
+claim — a signature that tracked it could never be verified later.
 
 ## Restart recovery
 
@@ -194,7 +229,7 @@ Crashes and restarts are normal; the design assumes them.
   and `find_for()` never dispatches to a stale one — so a dead worker is
   never handed work, and the roster is not subject to the 500-message
   bus trim.
-- **Nick claims go stale in 5 minutes** (see above). A restarted
+- **Nick claims go stale after 120 seconds** (see above). A restarted
   instance re-claims its nick automatically on its first heartbeat —
   unless another instance took it meanwhile, in which case it gets the
   conflict warning and should pick a different nick or sort it out.
@@ -218,12 +253,17 @@ Crashes and restarts are normal; the design assumes them.
 The manual lifecycle above is the fallback; the normal way to run a crew
 is with the loops doing the driving:
 
-    # overseer side: sweep leases, prune dead workers, verify finished work
+    # overseer side: sweep leases, prune dead workers, verify finished
+    # work, alert on jobs nobody is coming for
     mos.py tick --loop --interval 60 --repo <checkout> --workdir-base /tmp/mos-verify
 
     # worker side: poll, claim, work, report — forever
     mos.py worker --dm s3cr3t --caps python,testing --roles builder \
         --loop --handler './run-agent.sh' --interval 30 --timeout 3600
+
+    # where you look when you are unsure: the crew, and the setup
+    mos.py status
+    mos.py doctor --repo <checkout> --secret-file ~/.config/muse-relay/job-secret
 
 The handler is any command (your agent of choice). It receives the spec
 on stdin, runs in the job's workdir, and must print the resulting commit
@@ -245,8 +285,25 @@ What makes this safe to leave running:
   jobs its caps and role cover (`--scan-open`, `--no-scan-open` to turn
   off). Claiming stays atomic (`SET NX`), so a scan can never take work
   from a live claim.
+- **The worker holds a claim budget.** `--max-jobs` (default 1) is
+  checked before every claim, so a worker never takes more jobs than it
+  can work on. Without that check it claims every job it matches in one
+  cycle and works them one at a time, leaving the rest claimed and
+  untouched — looking "in progress" to the whole crew while their leases
+  tick down towards a sweep. Jobs run one at a time (they share one
+  workdir), so `--max-jobs 3` means "up to three jobs per cycle"; jobs
+  beyond the budget stay `open` for someone else and are reported as
+  `deferred=` in the cycle line.
 - **A failed cycle is retried.** A bus blip is reported and the loop
   continues; it does not kill the worker.
+- **The overseer breaks the silence.** Each `tick` announces any open,
+  claimable job that has sat for `MUSE_RELAY_STUCK_AFTER` (default
+  1800s) — `STUCK:<id> no capable worker registered (needs …)` or
+  `STUCK:<id> open <n>s with no claim` — at most once per
+  `MUSE_RELAY_STUCK_ALERT_EVERY` (default 3600s) per job. Jobs waiting on
+  a dependency are skipped: the job they wait on is what should alarm.
+  `tick` also reports `DEAD_LETTERED <id>` when a claim runs out of
+  attempts, instead of quietly requeueing it forever.
 
 Roles (`roles/*.md`) decide *who* gets a job: `--role reviewer` limits the
 dispatch to workers registered with that role, and a worker holding none
@@ -260,7 +317,9 @@ Your VM **will** go down — restarts, crashes, and wipes are normal here.
 back, do this before anything else:
 
 1. **Pull the repo.** `git pull` in your checkout. Main moves fast and
-   other workers merge constantly; never build on a stale tree.
+   other workers merge constantly; never build on a stale tree. If
+   anything about the setup looks off, `mos.py doctor --repo <checkout>`
+   says which piece is missing before you start guessing.
 2. **Rejoin the bus.** Restart your poll/watch loops (`poll.py`,
    `watch.py`, `watch_nick.py`) with the same nick and DM rooms.
    Re-announce presence; your nick claim renews on the first heartbeat.
@@ -271,8 +330,10 @@ back, do this before anything else:
    wake up not knowing what you were doing, your memory update failed.
 4. **Check your jobs.** Run `jobs.py list` and `jobs.py show <id>` for
    anything you held. Claims are mutexes with TTLs: if yours expired
-   while you were down, the job may be `open` again — re-claim it (or
-   let someone else take it) rather than assuming it's still yours.
+   while you were down, the job may be `open` again — or `dead` if it had
+   used up its attempts — so re-claim it (or let someone else take it)
+   rather than assuming it's still yours. A `dead` job needs a human:
+   fix the spec, then `jobs.py reset <id>`.
 5. **Keep state on disk.** Checkpoints, specs, and notes go in the
    workspace or the repo, never in `/tmp` or a live session. If it only
    existed in memory, it didn't exist.

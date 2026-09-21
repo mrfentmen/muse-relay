@@ -4,10 +4,13 @@
 One overseer per crew. It:
   - posts jobs (via jobs.py) and DMs capable workers (via send.py --dm),
   - runs `tick()` periodically: sweeps expired leases, prunes stale
-    capability registrations, and verifies done-but-unverified jobs,
+    capability registrations, announces jobs nobody is coming for, and
+    verifies done-but-unverified jobs,
   - verifies a done job's machine-readable acceptance criteria against
     the worker's branch before the job counts as truly done,
-  - requeues jobs whose acceptance fails, with the failure report as note.
+  - hands a failed job back with the failure report as its note — or
+    dead-letters it once its attempts are gone, so a spec nobody can
+    satisfy stops consuming the crew every cycle.
 
 All state stays in Redis; the bus carries announcements only.
 """
@@ -26,6 +29,15 @@ from mos import acceptance, capabilities  # noqa: E402
 from mos import gitops  # noqa: E402
 
 LEASE_DEFAULT = 1800
+
+# Silence is the scariest crew failure: a job can sit open for hours
+# because its DM never landed or because nobody can take it, and nothing
+# says so. tick() alerts on open jobs older than STUCK_AFTER, at most
+# once every STUCK_ALERT_EVERY seconds per job (so a loop does not spam
+# the bus).
+STUCK_AFTER = int(os.environ.get("MUSE_RELAY_STUCK_AFTER", "1800"))
+STUCK_ALERT_EVERY = int(
+    os.environ.get("MUSE_RELAY_STUCK_ALERT_EVERY", "3600"))
 
 
 def _say(room, text):
@@ -68,17 +80,36 @@ def _post_job(title, spec, accept, room, lease, branch, base, reqs=(),
     raise RuntimeError(f"could not parse job id from: {buf.getvalue()!r}")
 
 
+def _accept_with_files_only(accept, files, base):
+    """Add a files-only check when a job declares files AND a base.
+
+    Declaring files is only half the contract: jobs.py stops two jobs
+    claiming the same file, and this stops a worker writing outside the
+    set it claimed. It needs a base to diff against, so it is only
+    added when the dispatch names one.
+    """
+    if not files or not base:
+        return accept
+    if "files-only:" in (accept or ""):
+        return accept
+    line = f"files-only: {files}"
+    return (accept.rstrip() + "\n" + line) if (accept or "").strip() else line
+
+
 def dispatch(title, spec, accept="", requirements=(), room="",
              lease=LEASE_DEFAULT, branch="", base="", roles=(), files=""):
     """Post a job and DM every worker whose caps and role fit it.
 
     `files` declares the file set the job owns; jobs.py enforces it at
-    claim time so two workers never get handed the same file.
+    claim time so two workers never get handed the same file, and (with
+    a base to diff against) dispatch adds a files-only acceptance check
+    so the job is failed when its branch writes outside that set.
     Returns (jid, dm_results) where dm_results is
     [(nick, dm_ok, detail)].
     """
     if not spec or not spec.strip():
         raise ValueError("spec must not be empty")
+    accept = _accept_with_files_only(accept, files, base)
     reqs = [r.strip().lower() for r in requirements if r and r.strip()]
     want_roles = [r.strip().lower() for r in roles if r and r.strip()]
     jid = _post_job(title, spec, accept, room, lease, branch, base,
@@ -148,7 +179,8 @@ def verify_done(jid, repo=None, workdir_base=None):
                 gitops.worktree_reclaim(repo, wt_path)
             gitops.worktree_add(repo, branch, wt_path)
             workdir = wt_path
-        ok, results = acceptance.verify(h.get("accept", ""), workdir)
+        ok, results = acceptance.verify(h.get("accept", ""), workdir,
+                                       base=h.get("base", ""))
         report = acceptance.format_report(results)
     finally:
         if wt_path:
@@ -162,19 +194,15 @@ def verify_done(jid, repo=None, workdir_base=None):
         _set_verified(jid, True, report)
         _say(h.get("room", ""), f"VERIFIED:{jid}")
         return True, report
-    # Acceptance failed: reopen for another worker, keep the evidence.
+    # Acceptance failed: hand it back for another attempt while it has
+    # attempts left, and dead-letter it when it does not — with the
+    # report kept as the note either way, so the evidence survives.
+    state = jobs.settle_failed(jid, h, h.get("room", ""),
+                               reason="acceptance failed")
     jobs._hset(jobs._job_key(jid), {
-        "status": "open",
-        "note": f"acceptance failed:\n{report}"[-2000:],
-    })
-    jobs._hdel(jobs._job_key(jid), "claim", "claim_host", "claimed_at",
-               "lease_until", "result_commit", "verified", "verified_at",
-               "verify_report")
-    try:
-        rc.api_get(f"del/{jobs._claim_key(jid)}")
-    except Exception:
-        pass
-    _say(h.get("room", ""), f"REQUEUE:{jid} acceptance failed")
+        "note": f"acceptance failed:\n{report}"[-2000:]})
+    if state == "dead":
+        return False, report + "\n[DEAD-LETTERED] out of attempts"
     return False, report
 
 
@@ -193,20 +221,101 @@ def _done_unverified():
     return out
 
 
+def _dependency_is_doomed(h):
+    """True when a job waits on something that can never become done.
+
+    A blocked or dead-lettered dependency will never finish on its own,
+    so every job queued behind it is stalled too — and that stall is
+    otherwise completely silent.
+    """
+    for dep in jobs.deps_of(h):
+        dh, _ = jobs.job_get(dep)
+        if dh is None or dh.get("status") in ("blocked", "dead"):
+            return True
+    return False
+
+
+def _stuck_jobs(now=None):
+    """Open jobs nobody is coming for: [(jid, reason, room)].
+
+    A job legitimately waiting on a dependency that can still finish is
+    pending, not stuck — the job it waits on is what should alarm. A job
+    waiting on one that is blocked, dead-lettered or gone is stuck, and
+    would otherwise wait in silence forever.
+    """
+    now = int(now if now is not None else time.time())
+    out = []
+    try:
+        ids = jobs._all_ids()
+    except Exception:
+        return out
+    for jid in ids:
+        h = jobs._hgetall(jobs._job_key(jid))
+        if h.get("status") != "open":
+            continue
+        try:
+            created = int(h.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if not created or now - created < STUCK_AFTER:
+            continue
+        try:
+            last = int(h.get("stuck_alerted_at") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if last and now - last < STUCK_ALERT_EVERY:
+            continue
+        ready, why = jobs.deps_ready(jid, h)
+        if not ready:
+            if not _dependency_is_doomed(h):
+                continue
+            out.append((str(jid), f"waiting on {why}", h.get("room", "")))
+            continue
+        reqs = jobs.reqs_of(h)
+        want = jobs.roles_of(h)
+        if not capabilities.find_for(reqs, roles=want):
+            need = ",".join(sorted(reqs)) or "any"
+            if want:
+                need += f" roles={','.join(sorted(want))}"
+            reason = f"no capable worker registered (needs {need})"
+        else:
+            reason = f"open {now - created}s with no claim"
+        out.append((str(jid), reason, h.get("room", "")))
+    return out
+
+
+def _alert_stuck(report):
+    """Announce the jobs nobody is coming for, once per alert window."""
+    now = int(time.time())
+    for jid, reason, room in _stuck_jobs(now):
+        _say(room, f"STUCK:{jid} {reason}")
+        report["stuck"].append(jid)
+        try:
+            jobs._hset(jobs._job_key(jid), {"stuck_alerted_at": now})
+        except Exception as e:
+            report["errors"].append(f"stuck stamp {jid}: {e}")
+
+
 def tick(repo=None, workdir_base=None):
     """One overseer pass. Returns a report dict."""
     report = {"swept": [], "pruned": [], "verified": [], "failed": [],
-              "errors": []}
+              "dead": [], "stuck": [], "errors": []}
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         jobs.main(["sweep"])
     for line in buf.getvalue().splitlines():
         if line.startswith("REQUEUED "):
             report["swept"].append(line.split()[1])
+        elif line.startswith("DEAD_LETTERED "):
+            report["dead"].append(line.split()[1])
     try:
         report["pruned"] = capabilities.prune_stale()
     except Exception as e:
         report["errors"].append(f"prune_stale: {e}")
+    try:
+        _alert_stuck(report)
+    except Exception as e:
+        report["errors"].append(f"stuck alerts: {e}")
     for jid in _done_unverified():
         try:
             ok, _ = verify_done(jid, repo=repo, workdir_base=workdir_base)
@@ -221,9 +330,11 @@ def tick_lines(rep):
     nothing happened. Shared by the CLI and the loop so both print the
     same thing."""
     lines = [f"SWEPT {jid}" for jid in rep["swept"]]
+    lines += [f"DEAD_LETTERED {jid}" for jid in rep.get("dead", [])]
     lines += [f"PRUNED {nick}" for nick in rep["pruned"]]
     lines += [f"VERIFIED {jid}" for jid in rep["verified"]]
     lines += [f"ACCEPTANCE_FAILED {jid}" for jid in rep["failed"]]
+    lines += [f"STUCK {jid}" for jid in rep.get("stuck", [])]
     return lines or ["TICK_CLEAN"]
 
 

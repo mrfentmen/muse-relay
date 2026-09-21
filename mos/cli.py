@@ -13,6 +13,9 @@ Usage:
   mos.py worker --dm SECRET --caps python [--once]
   mos.py worker --dm SECRET --caps python --loop --handler 'CMD'
                 [--interval SECS] [--max-cycles N] [--scan-open]
+                [--max-jobs N]
+  mos.py status                    # who is online, what the queue holds
+  mos.py doctor [--secret-file F]  # preflight: config, bus, roles, git
   mos.py reconcile
   mos.py review --repo PATH --branch B [--base main]
   mos.py merge --repo PATH --branch B [--base main]
@@ -24,12 +27,14 @@ done/blocked. See mos/worker.py CommandHandler for what CMD is handed.
 Spec/accept may be given inline or via @file. Never prints the token.
 """
 import argparse
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import relay_common as rc  # noqa: E402
-from mos import capabilities, gitops, overseer, reconcile, worker  # noqa: E402
+from mos import capabilities, gitops, inspect as inspect_mod, overseer  # noqa: E402
+from mos import reconcile, worker  # noqa: E402
 from mos import roles as roles_mod  # noqa: E402
 
 
@@ -79,6 +84,24 @@ def cmd_caps(a):
         print(f"{nick}: caps={r.get('caps', '')} roles={r.get('roles', '')} "
               f"host={r.get('host', '')} updated={r.get('updated', '')}")
     return 0
+
+
+def cmd_status(a):
+    snap = inspect_mod.snapshot()
+    if a.json:
+        print(json.dumps(snap, sort_keys=True))
+        return 2 if snap.get("error") else 0
+    for line in inspect_mod.status_lines(snap):
+        print(line)
+    return 2 if snap.get("error") else 0
+
+
+def cmd_doctor(a):
+    checks = inspect_mod.doctor_checks(secret_file=a.secret_file or "",
+                                       repo=a.repo or None)
+    for line in inspect_mod.doctor_lines(checks):
+        print(line)
+    return 0 if inspect_mod.doctor_ok(checks) else 2
 
 
 def cmd_dispatch(a):
@@ -134,7 +157,7 @@ def cmd_worker(a):
     try:
         w = worker.Worker(dm_secret=a.dm or "", caps=caps,
                           roles=a.roles or "", workdir=a.workdir or ".",
-                          lease=a.lease, scan_open=scan)
+                          lease=a.lease, max_jobs=a.max_jobs, scan_open=scan)
     except roles_mod.RoleError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -223,6 +246,19 @@ def main(argv=None):
     p = sub.add_parser("caps", help="list registered agents")
     p.set_defaults(fn=cmd_caps)
 
+    p = sub.add_parser("status",
+                       help="who is online and what the queue holds")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable snapshot")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("doctor", help="preflight check the crew's setup")
+    p.add_argument("--secret-file", default="",
+                   help="also check this crew secret file parses")
+    p.add_argument("--repo", default=None,
+                   help="also check this path is a usable git repo")
+    p.set_defaults(fn=cmd_doctor)
+
     p = sub.add_parser("roles", help="list role skills, or print one")
     p.add_argument("name", nargs="?", default=None,
                    help="role to print (see roles/*.md); omit to list")
@@ -269,6 +305,9 @@ def main(argv=None):
     p.add_argument("--roles", default="", help="role skills to work as")
     p.add_argument("--workdir", default=".")
     p.add_argument("--lease", type=int, default=1800)
+    p.add_argument("--max-jobs", type=int, default=1,
+                   help="claims this worker may hold at once (default: 1); "
+                        "jobs run one at a time, so this bounds a cycle")
     p.add_argument("--once", action="store_true",
                    help="single poll+claim cycle, print spec")
     p.add_argument("--loop", action="store_true",

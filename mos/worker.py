@@ -21,7 +21,7 @@ DM read offsets live in Redis so a restarted worker never re-reads
 (and never misses) announcements — they ride on relay_common.bus_read,
 so a trimmed DM list is reported instead of quietly skipped.
 
-Three things keep a long handler from being sabotaged by its own crew:
+Four things keep a long handler from being sabotaged by its own crew:
   - the lease is renewed in the background while the handler runs
     (_keep_lease), so a build that outlives the lease is not swept
     mid-flight and handed to a second worker,
@@ -29,7 +29,10 @@ Three things keep a long handler from being sabotaged by its own crew:
     claiming (_matches), not just the ones in the DM text,
   - open jobs can be scanned when a DM was missed or the worker joined
     the crew late (scan_open); claiming is still atomic, so a scan can
-    never steal live work.
+    never steal live work,
+  - claims are capped by max_jobs (_capacity), so a job it cannot work
+    on right now stays open for the rest of the crew instead of sitting
+    claimed and untouched with its lease ticking down.
 """
 import contextlib
 import io
@@ -190,11 +193,15 @@ class Worker:
             max_jobs=self.max_jobs, dm_secret=self.dm_secret)
         return True
 
-    def heartbeat(self):
-        """Touch capability registration; renew leases on my claims."""
+    def heartbeat(self, claimed=None):
+        """Touch capability registration; renew leases on my claims.
+
+        `claimed` lets a caller that just listed them hand its view over
+        instead of making this scan the job index a second time.
+        """
         capabilities.touch(self.nick)
         renewed = []
-        for jid in self._my_claimed():
+        for jid in (self._my_claimed() if claimed is None else claimed):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc_code = jobs.main(["heartbeat", jid])
@@ -284,6 +291,11 @@ class Worker:
             h = jobs._hgetall(jobs._job_key(jid))
             if h.get("status") != "open":
                 continue
+            # A job waiting on a dependency is not claimable yet, so it
+            # is not a candidate: offering it would only produce a
+            # refused claim every cycle.
+            if not jobs.deps_ready(jid, h)[0]:
+                continue
             reqs = jobs.reqs_of(h)
             if self._matches(reqs, h):
                 out.append((str(jid), h.get("title", ""), reqs))
@@ -345,6 +357,23 @@ class Worker:
             stop.set()
             thread.join(timeout=5)
 
+    def _capacity(self, claimed=None):
+        """How many more jobs this worker may hold at once.
+
+        max_jobs has to bind locally as well as at dispatch: without
+        this a worker claims every job it matches in one cycle and then
+        works them one at a time, leaving the rest claimed, untouched,
+        and looking "in progress" to the whole crew while their leases
+        tick down. `claimed` is the caller's own list of live claims, so
+        the index is not scanned twice in one cycle.
+        """
+        try:
+            limit = max(1, int(self.max_jobs))
+        except (TypeError, ValueError):
+            limit = 1
+        held = len(self._my_claimed()) if claimed is None else len(claimed)
+        return max(0, limit - held)
+
     def _claim(self, jid):
         buf, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(buf), \
@@ -388,11 +417,18 @@ class Worker:
         return out
 
     def run_once(self, handler):
-        """One poll/claim/work cycle. Returns a report dict."""
+        """One poll/claim/work cycle. Returns a report dict.
+
+        The claim budget is checked before every claim, so a job this
+        worker cannot work on right now stays open for the rest of the
+        crew instead of being taken and left alone.
+        """
         report = {"claimed": [], "done": [], "blocked": [],
-                  "skipped": [], "errors": []}
+                  "skipped": [], "deferred": [], "errors": []}
         self.register()
-        self.heartbeat()
+        mine = self._my_claimed()
+        self.heartbeat(mine)
+        budget = self._capacity(mine)
         for jid, title, reqs in self.candidates():
             h, spec = jobs.job_get(jid)
             if h is None:
@@ -403,11 +439,15 @@ class Worker:
             if not self._matches(reqs | jobs.reqs_of(h), h):
                 report["skipped"].append(jid)
                 continue
+            if budget <= 0:
+                report["deferred"].append(jid)
+                continue
             ok, detail = self._claim(jid)
             if not ok:
                 report["errors"].append(f"claim {jid}: {detail.strip()[-200:]}")
                 continue
             report["claimed"].append(jid)
+            budget -= 1
             try:
                 with self._keep_lease(jid):
                     commit, note = handler(jid, title, spec or "",
@@ -454,7 +494,9 @@ class Worker:
         """One line per cycle so an unattended worker is observable."""
         print(f"cycle {self.nick}: claimed={len(rep['claimed'])} "
               f"done={len(rep['done'])} blocked={len(rep['blocked'])} "
-              f"skipped={len(rep['skipped'])} errors={len(rep['errors'])}",
+              f"skipped={len(rep['skipped'])} "
+              f"deferred={len(rep.get('deferred', []))} "
+              f"errors={len(rep['errors'])}",
               file=out, flush=True)
         for e in rep["errors"]:
             print(f"WARNING: {e}", file=sys.stderr)

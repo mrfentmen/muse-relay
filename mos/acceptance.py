@@ -7,14 +7,23 @@ A job's `accept` field is a list of checks, one per line:
     tests-pass: tests.test_something        (or tests/test_something.py)
     command-ok: python3 -m py_compile mos/overseer.py
     contains: path/to/file.py :: expected substring
+    files-only: a.py,mos/*.py
 
 The overseer runs these against the worker's branch checkout before the
 job counts as done. Anything unparseable is a failed check, never
 silently skipped.
 
-`verify(accept_text, workdir)` -> (ok: bool, results: list of dicts).
+`files-only` closes the other half of the file-ownership contract:
+--files stops two jobs claiming the same file, and files-only fails the
+job when its branch diff touches anything outside the declared set. It
+diffs <base>...HEAD, so it needs a base commit — the job's --base, or a
+local main/master (or origin/main) to merge-base against. Without one
+the check fails with the reason rather than passing by default.
+
+`verify(accept_text, workdir, base="")` -> (ok, results: list of dicts).
 Each result: {"check": str, "ok": bool, "detail": str}.
 """
+import fnmatch
 import os
 import subprocess
 import sys
@@ -32,7 +41,8 @@ def parse_accept(text):
         kind, _, arg = line.partition(":")
         kind = kind.strip().lower()
         arg = arg.strip()
-        if kind not in ("file-exists", "tests-pass", "command-ok", "contains"):
+        if kind not in ("file-exists", "tests-pass", "command-ok",
+                        "contains", "files-only"):
             raise ValueError(f"line {lineno}: unknown check {kind!r}")
         if not arg:
             raise ValueError(f"line {lineno}: empty argument")
@@ -65,7 +75,54 @@ def _run(cmd, workdir, timeout, shell=False):
         return 1, f"runner error: {e}"
 
 
-def run_checks(checks, workdir, timeout=300):
+def _resolve_base(workdir, base):
+    """Pick a commit to diff the branch against.
+
+    Returns (ref, "") or (None, why). An explicit base wins; otherwise
+    the first local main/master (or their origin/ form) is used through
+    its merge-base with HEAD, so a worker branch forked some time ago is
+    still measured from where it left off.
+    """
+    if base:
+        rc, _ = _run(["git", "rev-parse", "--verify",
+                      f"{base}^{{commit}}"], workdir, 30)
+        if rc == 0:
+            return base, ""
+        return None, f"base commit {base!r} not found in the checkout"
+    for ref in ("origin/main", "origin/master", "main", "master"):
+        rc, _ = _run(["git", "rev-parse", "--verify", ref], workdir, 30)
+        if rc != 0:
+            continue
+        rc, out = _run(["git", "merge-base", "HEAD", ref], workdir, 30)
+        if rc == 0 and out.strip():
+            return out.strip().splitlines()[-1], ""
+        return None, f"no merge-base between HEAD and {ref}"
+    return None, ("files-only needs a base commit — post the job with "
+                  "--base, or keep a local main/master branch")
+
+
+def _run_files_only(arg, workdir, base, timeout):
+    """Fail unless the branch diff touched only the declared files."""
+    allowed = [p.strip() for p in arg.split(",") if p.strip()]
+    ref, why = _resolve_base(workdir, base)
+    if ref is None:
+        return False, why
+    rc, out = _run(["git", "diff", "--name-only", f"{ref}...HEAD"],
+                   workdir, timeout)
+    if rc != 0:
+        return False, f"git diff failed (exit={rc}): {out[-300:]}"
+    changed = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    extra = [f for f in changed
+             if not any(fnmatch.fnmatch(f, pat) for pat in allowed)]
+    if extra:
+        return False, ("changed outside the declared file set: "
+                       + ", ".join(extra[:10])
+                       + (f" (+{len(extra) - 10} more)" if len(extra) > 10
+                          else ""))
+    return True, f"{len(changed)} changed file(s), all declared"
+
+
+def run_checks(checks, workdir, timeout=300, base=""):
     """Run parsed checks. Returns list of result dicts."""
     results = []
     for kind, arg in checks:
@@ -100,10 +157,14 @@ def run_checks(checks, workdir, timeout=300):
                 ok, detail = False, f"read error: {e}"
             results.append({"check": f"contains: {arg}", "ok": ok,
                             "detail": detail})
+        elif kind == "files-only":
+            ok, detail = _run_files_only(arg, workdir, base, timeout)
+            results.append({"check": f"files-only: {arg}", "ok": ok,
+                            "detail": detail})
     return results
 
 
-def verify(accept_text, workdir):
+def verify(accept_text, workdir, base=""):
     """Returns (ok, results). Empty accept text -> (True, []) with a note."""
     if not (accept_text or "").strip():
         return True, [{"check": "(no acceptance criteria)",
@@ -116,7 +177,7 @@ def verify(accept_text, workdir):
     if not checks:
         return True, [{"check": "(no acceptance criteria)",
                        "ok": True, "detail": "nothing to verify"}]
-    results = run_checks(checks, workdir)
+    results = run_checks(checks, workdir, base=base)
     return all(r["ok"] for r in results), results
 
 

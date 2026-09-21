@@ -411,9 +411,6 @@ class SignedJobTest(RelayTestCase):
         self.assertIn("signed_by: tester", out)
 
 
-if __name__ == "__main__":    unittest.main()
-
-
 class HardeningTest(RelayTestCase):
     """v2 hardening: key ids, expiry, jid-bound signatures, loud rejections."""
 
@@ -514,6 +511,56 @@ class HardeningTest(RelayTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "OK")
 
+    def test_v3_signature_still_verifies(self):
+        # Jobs signed before the deps/attempt-budget payload (v3) must
+        # keep verifying: an upgrade cannot invalidate the crew's queue.
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        h, _ = jobs.job_get("1")
+        jobs._hset(jobs._job_key("1"), {
+            "sig": jobs._sign_job_v3(b"crew-secret-abc", "1",
+                                     "crew-2026-09", h, "s"),
+            "sig_v": "3", "sig_kid": "crew-2026-09", "signed_by": "tester"})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
+    def test_deps_and_the_attempt_budget_are_signed(self):
+        # deps decide WHEN a job may be claimed and max_attempts decides
+        # whether a failure reopens it, so widening either must break the
+        # signature rather than silently take effect.
+        self.post_signed("--max-attempts", "5")
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(out.strip(), "OK")
+        jobs._hset(jobs._job_key("1"), {"max_attempts": "99"})
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_a_dependency_is_covered_by_the_signature(self):
+        self.post_signed()                   # job 1
+        self.post_signed("--depends-on", "1")  # job 2 waits on it
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "2", "--secret-file", self.keyring])
+        self.assertEqual(out.strip(), "OK")
+        jobs._hdel(jobs._job_key("2"), "deps")   # attacker drops the wait
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "2", "--secret-file", self.keyring])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "BAD")
+
+    def test_claiming_does_not_invalidate_the_signature(self):
+        # `attempts` moves on every claim, so it is deliberately not
+        # signed; a live claim must not break its own job.
+        self.post_signed()
+        self.run_cli(jobs.main, ["claim", "1"])
+        rc, out, _ = self.run_cli(
+            jobs.main, ["verify", "1", "--secret-file", self.keyring])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "OK")
+
     def test_files_reqs_and_role_are_covered_by_the_signature(self):
         # The ownership declaration decides who takes the job and which
         # files are theirs, so v3 signs it: widening a signed job's file
@@ -577,6 +624,18 @@ class HardeningTest(RelayTestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(out.strip(), "BAD")
 
+    def test_show_reports_verification(self):
+        # `show` is how a human inspects a job; the verification result
+        # is the difference between done and accepted, so it is printed.
+        self.run_cli(jobs.main, ["post", "--title", "T", "--spec", "s"])
+        jobs._hset(jobs._job_key("1"), {"verified": "1",
+                                        "verified_at": "123",
+                                        "verify_report": "[PASS] x"})
+        rc, out, err = self.run_cli(jobs.main, ["show", "1"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("verified: 1", out)
+        self.assertIn("verify_report: [PASS] x", out)
+
     def test_show_displays_sig_fields(self):
         self.post_signed("--expires", "3600")
         rc, out, _ = self.run_cli(jobs.main, ["show", "1"])
@@ -591,3 +650,7 @@ class HardeningTest(RelayTestCase):
             jobs.main, ["claim", "1", "--secret-file", self.keyring])
         self.assertEqual(rc, 0)
         self.assertIn("unsigned", err)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6,12 +6,20 @@ planned. Everything marked SHIPPED is implemented and tested.
 
 **Where the crew stands today.** The whole pre-mortem P0 list is
 *shipped* (it was written before any of it existed, and it read as an
-open to-do list for a while — that was misleading). The crew can now
-run without a human in the loop: workers poll, claim, work and report on
+open to-do list for a while — that was misleading). The crew can run
+without a human in the loop: workers poll, claim, work and report on
 their own, with leases renewed during the work, open-job fallback when a
-dispatch is missed, and file-ownership enforced at claim time. What is
-still genuinely open is at the bottom, and it is much shorter than it
-used to be.
+dispatch is missed, and file-ownership enforced at claim time.
+
+The 2026-09-21 guardrail pass closed the failure modes that made
+unattended operation lie about itself: a job now has an attempt budget
+and is dead-lettered instead of retried forever, a worker cannot claim
+more than it can work on, a job can declare dependencies and is not
+claimable until they are done, acceptance can fail a branch that wrote
+outside its declared files, the overseer alerts on jobs nobody is coming
+for, and `mos.py status`/`mos.py doctor` make the crew and its setup
+inspectable. What is still genuinely open is at the bottom, and it is
+much shorter than it used to be.
 
 ## 10 proposed relay features
 
@@ -165,8 +173,10 @@ you".
 2. **Nicks are still unauthenticated, but the crew has a floor under
    it.** Nick claims shipped (`muse-bus:nickclaim:<nick>`, SET NX, renewed
    by every presence heartbeat) — a tripwire, not auth. The real fix for
-   job spoofing also shipped: HMAC-signed jobs (v3, keyring with key
-   rotation, expiry, nonce, bound to the exact job id) and a worker that
+   job spoofing also shipped: HMAC-signed jobs (v4 — keyring with key
+   rotation, expiry, nonce, bound to the exact job id, covering the
+   ownership declaration and the deps/attempt-budget controls) and a
+   worker that
    refuses a BAD/EXPIRED signature and posts a loud `REJECTED:` alert.
    Signing is opt-in per crew; an unsigned job is still claimable, so
    use `--secret-file` when the crew is not fully trusted. SHIPPED.
@@ -186,8 +196,13 @@ you".
 6. **No capability registry.** The overseer assigns a security audit to
    an instance with no security skill. Fix: extend presence with
    `CAPS:<nick> <skill, skill, ...>` so dispatch matches ability.
+   SHIPPED (`mos/capabilities.py`: `mos.py register --caps/--roles/
+   --max-jobs`, matched by dispatch and by a worker's own scan).
 7. **No partial-progress visibility.** Silent for 2 hours: working or
    dead? Require periodic `PROGRESS:<id> <note>` tied to the claim lease.
+   SHIPPED (`jobs.py progress` renews the lease, and `mos.py tick`
+   announces a job that sits open past `MUSE_RELAY_STUCK_AFTER` with no
+   claim — including when no capable worker exists at all).
 8. **Merge conflicts between workers.** Jobs declare `--files a.py,b.py`
    and the claim is refused while a live job owns any of them
    (`--force` overrides). This is a guard, not a substitute for the
@@ -204,6 +219,11 @@ you".
 11. **Acceptance criteria or it didn't happen.** "Tests pass" is
     checkable; "implements the spec" is not. Every job ships with
     checkable acceptance criteria or quality dies at the merge.
+    SHIPPED as a mechanism (`--accept` with `file-exists`/`tests-pass`/
+    `command-ok`/`contains`/`files-only`, run by `mos.py tick`); the
+    discipline of actually posting criteria is still on the overseer, and
+    `mos.py dispatch` requires `--files` plus `--base` to add the
+    `files-only` check itself.
 
 ### P2 — security and ops hygiene
 
@@ -246,6 +266,12 @@ Build `jobs.py` + nick claims directly (one instance, the normal way),
    driving it, renews its own lease while a handler runs, and falls back
    to scanning open jobs when a dispatch was missed. `mos.py tick --loop`
    does the same for the overseer side (sweep, prune, verify).
+7. **Flow guardrails** — SHIPPED 2026-09-21: attempt budgets with
+   dead-lettering (`--max-attempts`, `jobs.py reset`), dependency-gated
+   claims (`--depends-on`), the `files-only` acceptance check (added
+   automatically by dispatch when files and a base are given), a local
+   claim budget in the worker (`--max-jobs`), stuck alerts in `tick`, a
+   secret tripwire on specs, and `mos.py status`/`mos.py doctor`.
 
 ### What is genuinely still open
 
@@ -275,3 +301,13 @@ bigger or less trusted.
    index behavior for that tab (no warning, no loss detection) until
    they are pushed to again — the counter only appears once something
    else has pushed.
+6. **A worker still runs one job at a time.** `--max-jobs N` bounds how
+   many jobs a worker takes per cycle, but it works them sequentially,
+   because every handler shares one workdir — two handlers in one
+   checkout would fight over the same files. Real concurrency needs a
+   git worktree per job (the overseer already does this for verification)
+   and a way to merge them back, which is not built yet.
+7. **A dead-lettered job still needs a human.** `sweep`/`tick` stop the
+   retry loop and announce it, but nothing re-plans the work, weakens the
+   acceptance criteria, or reassigns it to a different role. That is the
+   overseer agent's judgment call, by design.
