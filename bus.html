@@ -1525,6 +1525,143 @@ try {
   } catch (e) {}
 })();
 // === feature: fleet ===
+// === feature: notifications ===
+// Notification center. Collects NOTIFY lines (the notification
+// system's bus format: "NOTIFY:<id> <severity> [<topic>] <text>",
+// written by intel/notify on the OS side and notify.py on the
+// relay side) and ALERT lines (WDG-015) from every message, and
+// renders them in a "Notifications" panel, newest first. Unread
+// items (past this browser's per-room read marker in
+// localStorage) render bold, count into the document title, and
+// warning/critical items from other nicks fire a browser
+// Notification when permission is granted. "Mark all read" in
+// the panel advances the marker. Read state is this browser's
+// only — the durable record lives in the OS store.
+(function () {
+  "use strict";
+  var W = (typeof window !== "undefined") ? window : {};
+  var U = W.busUtil, H = W.busHooks;
+  if (!U || !H || !U.panel || !U.esc) return;
+
+  var MAX = 50;
+  var items = [];      // [{idx, nick, severity, topic, text, id}]
+  var seenIdx = {};    // idx -> 1, this room session
+  var room = null;
+  var primed = false;  // connect hook fired: later messages are live
+  var baseTitle = document.title;
+
+  var NOTIFY_RE = /^NOTIFY:(\S+)\s+(info|warning|critical)\s+\[([^\]]*)\]\s*(.*)$/;
+
+  function parse(nick, text) {
+    var m = String(text).match(NOTIFY_RE);
+    if (m) return { id: m[1], severity: m[2], topic: m[3], text: m[4] };
+    if (/^ALERT:/.test(text)) {
+      var sev = /critical/i.test(text) ? "critical" : "warning";
+      return { id: "", severity: sev, topic: "alert", text: text };
+    }
+    return null;
+  }
+
+  function readKey() { return "relay-notify-read:" + (room || ""); }
+  function lastRead() {
+    try { return parseInt(localStorage.getItem(readKey()) || "-1", 10); }
+    catch (e) { return -1; }
+  }
+  function setRead(idx) {
+    try { localStorage.setItem(readKey(), String(idx)); } catch (e) {}
+  }
+  function unread() {
+    var lr = lastRead(), n = 0;
+    for (var i = 0; i < items.length; i++) if (items[i].idx > lr) n++;
+    return n;
+  }
+
+  function pill(sev) {
+    var color = sev === "critical" ? "#e5534b"
+      : sev === "warning" ? "#d29922" : "#58a6ff";
+    return '<span class="pill" style="color:' + color + '">' +
+      U.esc(sev) + "</span>";
+  }
+
+  function render() {
+    try {
+      var body = U.panel("notifications", "Notifications");
+      var n = unread();
+      document.title = n ? "(" + n + ") " + baseTitle : baseTitle;
+      if (!items.length) {
+        body.innerHTML = '<div class="prow">no notifications yet</div>';
+        return;
+      }
+      var lr = lastRead();
+      var rows = items.slice(-MAX).reverse().map(function (it) {
+        var un = it.idx > lr ? ' style="font-weight:700"' : "";
+        return '<div class="prow"' + un + ">" + pill(it.severity) +
+          '<span style="color:' + U.nickColor(it.nick) + '">' +
+          U.esc(it.nick) + "</span> " + U.esc(it.text) + "</div>";
+      }).join("");
+      body.innerHTML =
+        '<div class="prow"><button id="notify-read-btn" type="button">' +
+        "mark all read (" + n + " unread)</button></div>" + rows;
+      var btn = document.getElementById("notify-read-btn");
+      if (btn) btn.addEventListener("click", function () {
+        if (items.length) setRead(items[items.length - 1].idx);
+        render();
+      });
+    } catch (e) { /* panel is decorative */ }
+  }
+
+  function collect(m, live) {
+    if (!m) return;
+    var p = parse(m.nick, m.text);
+    if (!p) return;
+    if (seenIdx[m.idx]) return;
+    seenIdx[m.idx] = 1;
+    items.push({ idx: m.idx, nick: m.nick, severity: p.severity,
+                 topic: p.topic, text: p.text, id: p.id });
+    if (live && m.nick !== U.myNick() &&
+        (p.severity === "critical" || p.severity === "warning")) {
+      try {
+        if (("Notification" in window) &&
+            Notification.permission === "granted") {
+          new Notification("muse-relay " + p.severity + ": " + m.nick,
+                           { body: p.text });
+        }
+      } catch (e) {}
+    }
+  }
+
+  function reset(ctx) {
+    if (ctx && ctx.room !== room) {
+      room = ctx.room; items = []; seenIdx = {}; primed = false;
+    }
+  }
+
+  H.message.push(function (ctx) {
+    try { reset(ctx); collect(ctx, primed); render(); } catch (e) {}
+  });
+  H.connect.push(function (ctx) {
+    try {
+      reset(ctx);
+      (ctx.history || []).forEach(function (m) { collect(m, false); });
+      primed = true;
+      render();
+    } catch (e) {}
+  });
+  H.poll.push(function (ctx) {
+    try {
+      reset(ctx);
+      (ctx.fresh || []).forEach(function (m) { collect(m, primed); });
+      render();
+    } catch (e) {}
+  });
+
+  try {
+    (W.__notify = W.__notify || {}).panel =
+      { parse: parse, items: items, collect: collect, render: render,
+        unread: unread };
+  } catch (e) {}
+})();
+// === feature: notifications ===
 // === feature: receipts ===
 // Read receipts. Publishes this viewer's max seen index to
 // muse-bus:seen:<roomkey> {nick: offset} on every tick, then decorates the
