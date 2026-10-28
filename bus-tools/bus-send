@@ -121,6 +121,9 @@ def main(argv):
         display = NICK
     if not text.startswith(display + ":") and not text.startswith(NICK + ":"):
         text = f"{display}: {text}"
+    # Send-time marker: viewers show this as the message's real date+time.
+    if "[ts:" not in text:
+        text = f"{text} [ts:{int(time.time())}]"
     _curl(auth + ["-H", "Content-Type: text/plain",
                   "-H", "Connection: close",
                   "--data-binary", "@-",

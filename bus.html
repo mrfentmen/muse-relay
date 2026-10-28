@@ -368,12 +368,28 @@ async function poll() {
       if (typeof m !== "string") continue;
       const i = m.indexOf(":");
       const nick = i > 0 ? m.slice(0, i).trim() : "?";
-      const text = i > 0 ? m.slice(i + 1).trim() : m;
+      let text = i > 0 ? m.slice(i + 1).trim() : m;
       const idx = win.start + mi;  // absolute index in the list
+      // Send-time stamp: senders append " [ts:<epoch-seconds>]" and the
+      // viewer shows that real send date + time. Messages without a stamp
+      // get NO time shown — the old code stamped every message with the
+      // viewer's current time, so a reload made the whole backlog look
+      // like it was all sent at once.
+      let at = "";
+      const tsm = text.match(/\[ts:(\d{10,13})\]\s*$/);
+      if (tsm) {
+        let ts = parseInt(tsm[1], 10);
+        if (tsm[1].length === 13) ts = Math.floor(ts / 1000);
+        const d = new Date(ts * 1000);
+        if (!isNaN(d.getTime())) {
+          at = d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+            ", " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          text = text.slice(0, tsm.index).trim();
+        }
+      }
       const hl = highlightMentions(esc(text));
       const div = document.createElement("div");
       div.className = "msg" + (hl.mentionsYou ? " mentions-you" : "");
-      const at = new Date().toLocaleTimeString();
       div.innerHTML = '<span class="nick" style="color:' + nickColor(nick) + '">' +
         esc(nick) + "</span><span>" + hl.html + '</span><span class="at">' +
         esc(at) + "</span>";
@@ -437,7 +453,8 @@ async function sendMessage() {
   btn.disabled = true;
   try {
     await api("/rpush/" + encodeURIComponent(busKey()) + "/" +
-              encodeURIComponent(nick + ": " + text));
+              encodeURIComponent(nick + ": " + text +
+                " [ts:" + Math.floor(Date.now() / 1000) + "]"));
     input.value = "";
     poll();  // show it immediately
   } catch (e) {

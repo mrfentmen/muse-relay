@@ -550,8 +550,44 @@ def bus_trim(key=None, keep=None):
     api_get(f"ltrim/{key or BUS}/-{keep}/-1")
 
 
+_TS_TAIL_RE = re.compile(r"\[ts:(\d{10,13})\]\s*$")
+
+
+def stamp_body(body, now=None):
+    """Append the send-time marker ' [ts:<epoch-seconds>]' to a chat body,
+    unless one is already there. Bus messages carry no server-side time, so
+    this marker is the only record of when a message was actually sent;
+    viewers render it as the message's real date + time. Bodies that are
+    not text are returned unchanged."""
+    if not isinstance(body, str) or _TS_TAIL_RE.search(body):
+        return body
+    ts = int(time.time()) if now is None else int(now)
+    return f"{body} [ts:{ts}]"
+
+
+def parse_ts(body):
+    """Epoch seconds from a body's trailing [ts:...] marker, or None."""
+    if not isinstance(body, str):
+        return None
+    m = _TS_TAIL_RE.search(body)
+    if not m:
+        return None
+    ts = int(m.group(1))
+    return ts // 1000 if len(m.group(1)) == 13 else ts
+
+
+def strip_ts(body):
+    """The body with any trailing [ts:...] marker removed."""
+    if not isinstance(body, str):
+        return body
+    return _TS_TAIL_RE.sub("", body).rstrip()
+
+
 def bus_push(body, key=None):
-    """Append a plain-text string to the bus; returns the raw response."""
+    """Append a plain-text string to the bus; returns the raw response.
+
+    Chat bodies are stamped with their send time (see stamp_body)."""
+    body = stamp_body(body)
     _check_config()
     token = _token()
     key = key or BUS
